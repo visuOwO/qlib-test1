@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+mlruns
+.vscode
+
+.python-version
+*.pkl
+qlib_source_csv/
+qlib_bin_data/
+*.log
+.ipynb_checkpoints/
+.idea/
+.DS_Store
+Thumbs.db
+venv/
+env/
+.env
+

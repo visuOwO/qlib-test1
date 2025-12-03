@@ -1,0 +1,10 @@
+[project]
+name = "qlib-test1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "tables>=3.10.2",
+    "tushare>=1.4.24",
+]
