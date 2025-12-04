@@ -96,6 +96,45 @@ def process_single_stock(pro, ts_code, start_date, end_date):
         print(f"Error processing {ts_code}: {e}")
         return None
 
+def process_index_data(pro, ts_code, start_date, end_date):
+    """
+    下载指数数据 (如沪深300) 并格式化为 Qlib 格式
+    """
+    print(f"\n开始下载指数数据: {ts_code} ...")
+    try:
+        df = pro.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        if df.empty:
+            print(f"指数 {ts_code} 数据为空")
+            return
+
+        data = pd.DataFrame()
+        data['date'] = pd.to_datetime(df['trade_date'])
+        data['open'] = df['open']
+        data['high'] = df['high']
+        data['low'] = df['low']
+        data['close'] = df['close']
+        
+        # 指数成交量通常单位也是手，成交额也是千元，保持统一转换
+        data['volume'] = df['vol'] * 100
+        data['amount'] = df['amount'] * 1000
+        
+        # 指数没有复权因子，默认为 1.0
+        data['factor'] = 1.0
+        
+        data = data.sort_values('date').reset_index(drop=True)
+        data['date'] = data['date'].dt.strftime('%Y-%m-%d')
+        
+        # 转换文件名: 000300.SH -> sh000300.csv
+        parts = ts_code.split('.')
+        qlib_code = f"{parts[1].lower()}{parts[0]}"
+        file_path = CSV_OUTPUT_DIR / f"{qlib_code}.csv"
+        
+        data.to_csv(file_path, index=False)
+        print(f"指数 {ts_code} 下载完成，保存至 {file_path}")
+
+    except Exception as e:
+        print(f"Error processing index {ts_code}: {e}")
+
 def main():
     pro = init_tushare()
     ensure_dir(CSV_OUTPUT_DIR)
@@ -133,6 +172,9 @@ def main():
         
         # Tushare 免费接口有频率限制，务必加 sleep
         time.sleep(0.3) 
+
+    # 下载沪深300指数作为基准
+    process_index_data(pro, '000300.SH', START_DATE, END_DATE)
 
     print(f"\nCSV 下载完成! 成功: {success_count}。文件保存在: {CSV_OUTPUT_DIR}")
     print("下一步：请运行 Qlib 的 dump_bin 命令将 CSV 转换为 Bin 文件。")

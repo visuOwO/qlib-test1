@@ -1,6 +1,7 @@
 import qlib
 import pandas as pd
 import numpy as np
+import traceback
 from qlib.data import D
 from qlib.utils import init_instance_by_config
 from qlib.config import C
@@ -14,20 +15,35 @@ if not C.get("initialized", False):
 
 # --- 2. 因子评估环境 (简化版) ---
 class FactorMiningEnv:
-    def __init__(self, start_date, end_date, benchmark_code="SH000300"):
+    def __init__(self, start_date, end_date, benchmark_code="sh000300"):
         self.start_date = start_date
         self.end_date = end_date
         self.benchmark_code = benchmark_code
-        self.raw_features = ["$open", "$high", "$low", "$close", "$volume"] # 基础因子，可以扩展
+        # 扩展基础因子
+        self.raw_features = [
+            "$open", "$high", "$low", "$close", "$volume", 
+            "$amount", "$turnover_rate"
+        ]
+        
+        # 预加载基准数据 (用于计算超额收益)
+        self.benchmark_ret = self._get_benchmark_return()
+
+    def _get_benchmark_return(self):
+        try:
+            # 获取基准指数的未来1日收益，以便与策略的Target对齐
+            df = D.features([self.benchmark_code], ["Ref($close, -1)/$close - 1"], self.start_date, self.end_date)
+            if not df.empty and isinstance(df.index, pd.MultiIndex):
+                df = df.droplevel(0)
+            return df
+        except Exception as e:
+            print(f"Error loading benchmark {self.benchmark_code}: {e}")
+            return pd.DataFrame()
 
     def _get_target_data(self, instrument="all", freq="day"):
         # 获取未来1日收益作为标签
-        # Ref($close, -1) / $close - 1 是未来1日收益率
-        # 为了简化，这里直接用 Qlib 提供的标签数据
-        # (实际中，您可能需要自己定义标签，比如未来5日收益等)
         return D.features(
             D.instruments(instrument),
-            ["Ref($close, -1)/$close - 1"], # 未来1日收益作为标签
+            ["Ref($close, -1)/$close - 1"], 
             start_time=self.start_date,
             end_time=self.end_date,
             freq=freq
@@ -35,13 +51,13 @@ class FactorMiningEnv:
 
     def evaluate_factor(self, factor_expression: str) -> tuple:
         """
-        评估一个因子表达式的表现，返回 (Sharpe Ratio, IC)。
+        评估一个因子表达式的表现，返回 (Information Ratio, IC)。
+        Information Ratio (IR) = Top 20% 组超额收益 / 超额收益波动率
         """
         try:
             # 1. 获取目标 (标签) 数据
             target_df = self._get_target_data()
             if target_df.empty:
-                print("Warning: Target data is empty.")
                 return -1.0, -1.0
 
             # 2. 获取自定义因子数据
@@ -70,6 +86,7 @@ class FactorMiningEnv:
             merged_df.dropna(inplace=True)
 
             if merged_df.empty:
+                print(f"Warning: Merged_data if empty.")
                 return -1.0, -1.0
 
             # --- 计算 IC ---
@@ -79,38 +96,49 @@ class FactorMiningEnv:
             ic = ic_series.mean()
             if np.isnan(ic): ic = -1.0
 
-            # --- 计算 Sharpe Ratio ---
+            # --- 计算 Information Ratio (IR) ---
             def get_group_return(df_day):
                 try:
                     # 将当天所有股票按因子值分为 5 组
                     df_day['group'] = pd.qcut(df_day[factor_expression], 5, labels=False, duplicates='drop')
-                    # 计算每组的平均收益
                     return df_day.groupby('group')['target'].mean()
                 except ValueError:
                     return pd.Series()
 
             daily_group_returns = merged_df.groupby(level='datetime').apply(get_group_return)
             
-            if 4 not in daily_group_returns.columns or 0 not in daily_group_returns.columns:
+            # 我们关注 Top 20% (Group 4) 的表现
+            if 4 not in daily_group_returns.columns:
                  return -1.0, ic
 
+            # 策略收益: 只做多 Top 20%
             long_ret = daily_group_returns[4]
-            short_ret = daily_group_returns[0]
-            strategy_ret = long_ret - short_ret
-
-            mean_ret = strategy_ret.mean()
-            std_ret = strategy_ret.std()
-
-            if std_ret == 0 or np.isnan(std_ret):
-                sharpe = -1.0
-            else:
-                sharpe = (mean_ret / std_ret) * np.sqrt(252)
-                if np.isnan(sharpe): sharpe = -1.0
             
-            return sharpe, ic
+            # 对齐基准收益
+            if self.benchmark_ret.empty:
+                bench_ret = pd.Series(0, index=long_ret.index)
+            else:
+                # 使用 reindex 确保日期对齐，fillna(0) 防止基准缺失导致计算失败
+                bench_ret = self.benchmark_ret.reindex(long_ret.index).fillna(0).iloc[:, 0]
+
+            # 超额收益 (Excess Return)
+            excess_ret = long_ret - bench_ret
+
+            mean_excess = excess_ret.mean()
+            std_excess = excess_ret.std()
+
+            if std_excess == 0 or np.isnan(std_excess):
+                ir = -1.0
+            else:
+                # 年化 IR
+                ir = (mean_excess / std_excess) * np.sqrt(252)
+                if np.isnan(ir): ir = -1.0
+            
+            return ir, ic
 
         except Exception as e:
-            # print(f"Error evaluating factor '{factor_expression}': {e}")
+            print(f"Error evaluating factor '{factor_expression}': {e}")
+            traceback.print_exc()
             return -1.0, -1.0
 
 # --- 3. 简单的 RL Agent (随机 Agent) ---
@@ -154,27 +182,27 @@ class RandomFactorAgent:
     def run(self, num_iterations=10):
         print("\n--- 开始强化学习因子挖掘 (随机 Agent 演示) ---")
         best_factor = ""
-        best_sharpe = -float('inf')
-        best_ic_for_sharpe = 0.0
+        best_ir = -float('inf')
+        best_ic = 0.0
 
         for i in range(num_iterations):
             print(f"\n--- 迭代 {i+1}/{num_iterations} ---")
             factor_expr = self.generate_factor_expression()
             print(f"生成的因子表达式: {factor_expr}")
 
-            sharpe, ic = self.env.evaluate_factor(factor_expr)
-            print(f"评估结果: Sharpe={sharpe:.4f}, IC={ic:.4f}")
+            ir, ic = self.env.evaluate_factor(factor_expr)
+            print(f"评估结果: IR={ir:.4f}, IC={ic:.4f}")
 
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_ic_for_sharpe = ic
+            if ir > best_ir:
+                best_ir = ir
+                best_ic = ic
                 best_factor = factor_expr
-                print(f"!!! 发现更好的因子: {best_factor} (Sharpe: {best_sharpe:.4f}, IC: {best_ic_for_sharpe:.4f}) !!!")
+                print(f"!!! 发现更好的因子: {best_factor} (IR: {best_ir:.4f}, IC: {best_ic:.4f}) !!!")
             
         print("\n--- 因子挖掘完成 ---")
         print(f"最佳因子表达式: {best_factor}")
-        print(f"最佳 Sharpe Ratio: {best_sharpe:.4f}")
-        print(f"对应的 IC Score: {best_ic_for_sharpe:.4f}")
+        print(f"最佳 Sharpe Ratio: {best_ir:.4f}")
+        print(f"对应的 IC Score: {best_ic:.4f}")
 
 # --- 主程序入口 ---
 if __name__ == "__main__":

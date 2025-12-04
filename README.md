@@ -80,3 +80,31 @@ python show_results.py
 
 *   **添加因子**: 创建一个继承自 `qlib.contrib.data.handler.Alpha158` 的自定义类，并在 `get_feature_config` 中添加您的公式。然后更新 `run_strategy.py` 以使用您的新类。
 *   **修改策略**: 修改 `run_strategy.py` 中的 `port_analysis_config` 部分。
+
+## 进阶功能：AI 因子挖掘
+
+本项目包含一个实验性的脚本 `rl_factor_mining.py`，用于探索使用 AI（目前为随机搜索 Agent）自动挖掘有效因子。
+
+### 功能简介
+
+该脚本会自动组合基础行情数据（如 `$close`, `$open`, `$turnover_rate` 等）和数学算子（如 `Add`, `Mean`, `Ref`），生成候选因子公式，并利用 Qlib 快速评估其表现。
+
+### 工作原理
+
+1.  **动作空间**: Agent 随机选择操作数和操作符构建公式（例如 `Div($close, Mean($close, 5))`）。
+2.  **评估环境**:
+    *   **基准对比**: 自动加载沪深300 (`sh000300`) 作为市场基准。
+    *   **评价指标**:
+        *   **IC (Information Coefficient)**: 衡量因子值与未来收益的线性相关性。
+        *   **IR (Information Ratio)**: 衡量 Top 20% 多头策略相对于基准的**超额收益**的夏普比率。
+3.  **目标**: 寻找 IR 和 IC 较高的因子表达式。
+
+### 使用方法
+
+确保您已完成数据下载（包括指数数据）和转换步骤，然后运行：
+
+```bash
+python rl_factor_mining.py
+```
+
+*输出：脚本将迭代生成因子，并打印出每个因子的 IR 和 IC。最终会输出表现最好的因子公式。*
