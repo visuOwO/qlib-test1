@@ -6,21 +6,20 @@ import numpy as np
 import collections
 from factor_builder import FactorBuilder
 from factor_validator import FactorValidator
-from dqn_model import DQN
+from dqn_model import DQN, RNN_DQN
 
 class DeepQLearningAgent:
     def __init__(self, env, hidden_dim=128, lr=1e-3, gamma=0.99, epsilon=1.0):
         self.env = env
         self.builder = FactorBuilder(max_depth=3, features=env.raw_features)
         
-        self.state_dim = 3 # Defined in FactorBuilder.get_state
         self.action_dim = len(self.builder.action_map)
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Agent using device: {self.device}")
         
-        self.policy_net = DQN(self.state_dim, self.action_dim).to(self.device)
-        self.target_net = DQN(self.state_dim, self.action_dim).to(self.device)
+        self.policy_net = RNN_DQN(action_dim=self.action_dim, hidden_dim=hidden_dim).to(self.device)
+        self.target_net = RNN_DQN(action_dim=self.action_dim, hidden_dim=hidden_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
         
@@ -39,7 +38,7 @@ class DeepQLearningAgent:
             return random.choice(valid_actions)
         
         with torch.no_grad():
-            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            state_t = torch.LongTensor(state).unsqueeze(0).to(self.device)
             q_values = self.policy_net(state_t)
             
             # Mask invalid actions with -inf
@@ -56,10 +55,10 @@ class DeepQLearningAgent:
         batch = random.sample(self.memory, self.batch_size)
         state_batch, action_batch, reward_batch, next_state_batch, done_batch = zip(*batch)
 
-        state_batch = torch.FloatTensor(np.array(state_batch)).to(self.device)
+        state_batch = torch.LongTensor(np.array(state_batch)).to(self.device)
         action_batch = torch.LongTensor(action_batch).unsqueeze(1).to(self.device)
         reward_batch = torch.FloatTensor(reward_batch).unsqueeze(1).to(self.device)
-        next_state_batch = torch.FloatTensor(np.array(next_state_batch)).to(self.device)
+        next_state_batch = torch.LongTensor(np.array(next_state_batch)).to(self.device)
         done_batch = torch.FloatTensor(done_batch).unsqueeze(1).to(self.device)
 
         # Compute Q(s, a)

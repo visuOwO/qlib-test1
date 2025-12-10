@@ -39,6 +39,9 @@ class FactorBuilder:
         self.action_map.extend([(op, 'UNARY_SIMPLE') for op in self.ops_unary_simple])
         self.action_map.extend([(f, 'FEATURE') for f in self.features])
         self.action_map.extend([(i, 'INT') for i in set(self.windows + self.offsets)])
+
+        self.max_seq_len = 20 # 定义一个最大序列长度，比如20
+        self.action_history = [] # 用于记录历史动作
         
         self.reset()
 
@@ -47,19 +50,25 @@ class FactorBuilder:
         self.stack = [(self.TYPE_OP, 0)] 
         self.expression_parts = [] # To store the constructed tree structure
         self.done = False
+        self.action_history = [] # 重置历史
         return self.get_state()
 
     def get_state(self):
         """
-        Returns a vector representation of the current state.
-        Vector Size: 3 (Depth, Type, IsStackEmpty)
+        返回 历史动作序列 (定长，不足补0)
         """
-        if not self.stack:
-            return np.array([0, -1, 1], dtype=np.float32)
+        # 复制一份历史
+        seq = list(self.action_history)
         
-        req_type, depth = self.stack[-1]
-        # Normalize depth
-        return np.array([depth / self.max_depth, req_type, 0], dtype=np.float32)
+        # 截断或填充到固定长度 (Padding)
+        # 假设 0 是 padding id，所以我们的动作索引最好从 1 开始，或者单独留出 0
+        # 这里为了简单，直接补 0。注意：这要求您的 action_map 里的有效动作最好不要太依赖 0
+        if len(seq) < self.max_seq_len:
+            seq = seq + [0] * (self.max_seq_len - len(seq))
+        else:
+            seq = seq[-self.max_seq_len:] # 只取最后 N 步
+            
+        return np.array(seq, dtype=np.int64) # 必须是整数类型!
 
     def get_valid_actions(self):
         """
@@ -97,6 +106,9 @@ class FactorBuilder:
     def step(self, action_idx):
         if self.done:
             raise Exception("Episode is done")
+        
+        # 记录动作
+        self.action_history.append(action_idx)
 
         val, kind = self.action_map[action_idx]
         req_type, depth = self.stack.pop()
