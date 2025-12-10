@@ -111,12 +111,12 @@ class DeepQLearningAgent:
 
                 if done:
                     expr = self.builder.build_expression()
-                    print(f"Evaluating: {expr}")
+                    # print(f"Evaluating: {expr}")
 
                     # 1. 语法校验
                     if not self.validator.validate(expr):
                         # 如果物理量纲错误 (如 Price + Volume)
-                        print(f"Invalid Logic (Type Mismatch): {expr}")
+                        # print(f"Invalid Logic (Type Mismatch): {expr}")
                         reward = -10.0 # 给一个较重的惩罚，告诉它不要这样做
 
                     # 2. 重复性校验

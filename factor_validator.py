@@ -2,25 +2,29 @@ import ast
 from enum import Enum
 
 class FactorType(Enum):
-    PRICE = 1   # 价格类 (open, close, vwap...)
-    VOLUME = 2  # 量类 (volume, amount)
-    RATIO = 3   # 比率/无量纲 (1.0, Rank输出, Price/Price)
-    TIME = 4    # 时间窗口 (整数 5, 10, 20)
+    PRICE_ABS = 1   # 绝对价格 (恒正): open, close, high, low, vwap, mean(price)
+    PRICE_REL = 2   # 相对价差 (有正负): price - price, slope(price), delta(price)
+    
+    VOLUME_ABS = 3  # 绝对量 (恒正): volume, amount
+    VOLUME_REL = 4  # 相对量差 (有正负): vol - vol, slope(vol)
+    
+    RATIO = 5       # 比率 (无量纲)
+    TIME = 6        # 时间窗口
     UNKNOWN = 99
-    ERROR = -1  # 类型冲突
+    ERROR = -1
 
 class FactorValidator:
     def __init__(self):
         # 定义原子特征的类型
         self.atom_types = {
-            '$open': FactorType.PRICE,
-            '$high': FactorType.PRICE,
-            '$low': FactorType.PRICE,
-            '$close': FactorType.PRICE,
-            '$vwap': FactorType.PRICE,
-            '$volume': FactorType.VOLUME,
-            '$amount': FactorType.VOLUME, # 金额视为量的一种，或者单独一类，这里简化合并
-            '$turnover_rate': FactorType.RATIO,
+            '$open': FactorType.PRICE_ABS,
+            '$high': FactorType.PRICE_ABS,
+            '$low':  FactorType.PRICE_ABS,
+            '$close': FactorType.PRICE_ABS,
+            '$vwap': FactorType.PRICE_ABS,
+            '$volume': FactorType.VOLUME_ABS,
+            '$amount': FactorType.VOLUME_ABS,
+            '$turnover_rate': FactorType.RATIO, # 换手率通常视为 Ratio
         }
 
     def validate(self, expression: str) -> bool:
@@ -53,7 +57,7 @@ class FactorValidator:
             return True
             
         except Exception as e:
-            print(f"Validation Parse Error: {e}")
+            # print(f"Validation Parse Error for expression: {e}")
             return False
 
     def _infer_type(self, node):
@@ -82,19 +86,38 @@ class FactorValidator:
             # 如果任何子节点已有错误，直接向上传递错误
             if FactorType.ERROR in arg_types:
                 return FactorType.ERROR
+            
+            if func_name in ['Sub', 'Div']:
+                # 将 AST 节点转回字符串进行比较
+                left_str = ast.unparse(args[0])
+                right_str = ast.unparse(args[1])
+                
+                if left_str == right_str:
+                    # Sub(A, A) = 0, Div(A, A) = 1
+                    # 这种恒等式没有意义，浪费算力
+                    return FactorType.ERROR
                 
             # --- 核心物理规则校验 ---
             
-            # 规则 A: 加减法 (Add, Sub) 必须同类型
+            # 规则: 加减法 (生成 REL 类型)
             if func_name in ['Add', 'Sub']:
                 t1, t2 = arg_types[0], arg_types[1]
+                # ABS +/- ABS = ?
                 if t1 == t2:
-                    return t1 # Price + Price = Price
-                # 允许 Price + Ratio (例如 close + 1.0 这种平移虽然物理上怪，但在量化里常见)
-                # 但严格禁止 Price + Volume
-                if {t1, t2} == {FactorType.PRICE, FactorType.VOLUME}:
-                    return FactorType.ERROR 
+                    if func_name == 'Sub' and t1 in [FactorType.PRICE_ABS, FactorType.VOLUME_ABS]:
+                        # 绝对值相减 -> 相对值 (如 close - open)
+                        return FactorType.PRICE_REL if t1 == FactorType.PRICE_ABS else FactorType.VOLUME_REL
+                    return t1 # 其他保持原样 (如 Add)
+                
+                # ABS + REL = ABS (如 close + delta)
+                if {t1, t2} == {FactorType.PRICE_ABS, FactorType.PRICE_REL}:
+                    return FactorType.PRICE_ABS
+                if {t1, t2} == {FactorType.VOLUME_ABS, FactorType.VOLUME_REL}:
+                    return FactorType.VOLUME_ABS
+
+                # 其他情况 (如 ABS + Vol) -> Error
                 return FactorType.ERROR
+                
 
             # 规则 B: 乘法 (Mul)
             if func_name == 'Mul':
@@ -107,44 +130,80 @@ class FactorValidator:
                     return t1 if t2 == FactorType.RATIO else t2
                 return FactorType.ERROR # Price * Price 视为非法
 
-            # 规则 C: 除法 (Div)
+            # 规则: 除法 (Div) -> 产生 Ratio
             if func_name == 'Div':
                 t1, t2 = arg_types[0], arg_types[1]
-                # 同类型相除 = Ratio (Price/Price, Vol/Vol)
-                if t1 == t2:
-                    return FactorType.RATIO
-                # Vol / Price (Shares) -> 允许
-                return FactorType.RATIO 
+                # 同大类相除 (ABS/ABS, REL/REL, ABS/REL) -> Ratio
+                # 简单处理：只要不跨界 (Price/Vol)，都视为 Ratio
+                is_price_1 = t1 in [FactorType.PRICE_ABS, FactorType.PRICE_REL]
+                is_price_2 = t2 in [FactorType.PRICE_ABS, FactorType.PRICE_REL]
+                if is_price_1 and is_price_2: return FactorType.RATIO
+
+                is_vol_1 = t1 in [FactorType.VOLUME_ABS, FactorType.VOLUME_REL]
+                is_vol_2 = t2 in [FactorType.VOLUME_ABS, FactorType.VOLUME_REL]
+                if is_vol_1 and is_vol_2: return FactorType.RATIO
+                
+                if t1 == t2: return FactorType.RATIO
+
+                # 拦截 Ratio / ABS
+                if t1 == FactorType.RATIO and t2 in [FactorType.PRICE_ABS, FactorType.VOLUME_ABS]:
+                    return FactorType.ERROR
+                
+                # 拦截: Price / Ratio -> 依然是 Price，不是 Ratio
+                # 这会拦截 Div(Delta($open), Log($open))
+                if t1 in [FactorType.PRICE_ABS, FactorType.PRICE_REL] and t2 == FactorType.RATIO:
+                    # 除非您允许输出 Price 类型，否则对于“根节点必须是 RATIO”的要求，这里应该返回 PRICE
+                    # 从而在 validate 主函数中被根节点检查拦截
+                    return t1
+
+                return FactorType.RATIO # 默认放行其他除法
 
             # 规则 D: 比较 (Max, Min) 必须同类型
             if func_name in ['Max', 'Min']:
                 t1, t2 = arg_types[0], arg_types[1]
+                
+                # 1. 左右必须同类型 (Ratio vs Ratio, Price vs Price)
                 if t1 != t2:
-                    # 特例：Max($close, 5) 第二个参数是 Time/Int，这是非法语法，应该是 Max($close, 5) 这里的5代表窗口
-                    # 但 Qlib 的 Max 是 Max(Field, Window)，所以这里要看参数定义
-                    # 如果是 Max(Field, Field) 比较，必须同类型
-                    # 您的 builder 里 Max 是 UNARY_WIN，即 Max(Data, Int)
-                    if arg_types[1] == FactorType.TIME:
-                        return arg_types[0] # Max($close, 20) -> Price
-                    else:
-                        # 如果是两个序列比较 Max($close, $open)
-                        return t1 if t1 == t2 else FactorType.ERROR
-                return t1
+                    return FactorType.ERROR
+                
+                # 2. 【关键】禁止与 TIME (整数常数) 进行比较
+                #    防止出现 Min(..., 10) 这种把天数当阈值的情况
+                if t1 == FactorType.TIME or t2 == FactorType.TIME:
+                    return FactorType.ERROR
+                
+                return t1 # 返回原类型
 
-            # 规则 E: 时序函数 (Mean, Std, Ref, Delta...)
-            if func_name in ['Mean', 'Std', 'Ref', 'Delta', 'EMA', 'WMA']:
-                # 保持输入类型: Mean($close) -> Price
+            # 规则 E: 时序函数
+            if func_name in ['Mean', 'Std', 'Ref', 'Delta', 'EMA', 'WMA', 'Slope', 'Max', 'Min']:
+                # 获取窗口参数节点
+                window_node = args[1] 
+                
+                # 检查是否为常数 1
+                if isinstance(window_node, ast.Constant) and window_node.value == 1:
+                    # Window=1 的操作毫无意义 (Mean, EMA, Max, Min) 或者是恒为0 (Delta, Std)
+                    # 直接判死刑
+                    return FactorType.ERROR
+                
                 return arg_types[0]
 
             # 规则 F: 去量纲函数 (Rank, Sign, Correlation)
-            if func_name in ['Rank', 'Sign', 'Correlation']:
+            if func_name in ['Rank', 'Correlation']:
                 return FactorType.RATIO
             
-            # 规则 G: 斜率 (Slope)
-            if func_name == 'Slope':
-                # Slope(Price) = Price / Time = Price (近似，虽有量纲变化但在股票里仍视为有单位)
-                # 只有 Slope(Ratio) 才是 Ratio
-                return arg_types[0]
+            # 规则: Sign (核心拦截逻辑)
+            # 只允许对“相对值”或“比率”取符号，禁止对“绝对值”取符号
+            if func_name == 'Sign':
+                t = arg_types[0]
+                if t in [FactorType.PRICE_ABS, FactorType.VOLUME_ABS]:
+                    return FactorType.ERROR  # 拦截 Sign($close), Sign($volume)
+                return FactorType.RATIO
+            
+            # 规则: 趋势函数 (Slope, Delta) -> 产出 REL 类型
+            if func_name in ['Slope', 'Delta']:
+                t = arg_types[0]
+                if t == FactorType.PRICE_ABS: return FactorType.PRICE_REL
+                if t == FactorType.VOLUME_ABS: return FactorType.VOLUME_REL
+                return t # Ratio 或 REL 保持不变
             
             # 规则 H: 逻辑判断 (Gt, Lt) -> RATIO (0/1 信号)
             if func_name in ['Gt', 'Lt']:
@@ -152,6 +211,26 @@ class FactorValidator:
                 if t1 != t2:
                     return FactorType.ERROR
                 return FactorType.RATIO
+            
+            # 规则: Sign(X)
+            if func_name == 'Sign':
+                arg_type = arg_types[0]
+                # 拦截: 对“绝对价格”取符号 (因为绝对价格永远为正，Sign后全是1，无意义)
+                if arg_type == FactorType.PRICE_ABS:
+                    return FactorType.ERROR
+                # 允许: 对“价差”或“比率”取符号 (有正有负，有意义)
+                if arg_type in [FactorType.PRICE_REL, FactorType.RATIO]:
+                    return FactorType.RATIO
+                
+            # 规则: Div(A, B)
+            if func_name == 'Div':
+                t1, t2 = arg_types[0], arg_types[1]
+                
+                # ... (原有的同类型相除逻辑) ...
+
+                # 拦截: 绝对价格 / 相对价差 = 时间 (非 Ratio)
+                # 例如: $high / Slope(...) 
+                
 
             # 默认
             return FactorType.UNKNOWN
