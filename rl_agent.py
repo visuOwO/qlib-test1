@@ -5,6 +5,7 @@ import random
 import numpy as np
 import collections
 from factor_builder import FactorBuilder
+from factor_validator import FactorValidator
 from dqn_model import DQN
 
 class DeepQLearningAgent:
@@ -25,6 +26,7 @@ class DeepQLearningAgent:
         
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
         self.memory = collections.deque(maxlen=2000)
+        self.validator = FactorValidator()
         
         self.gamma = gamma
         self.epsilon = epsilon
@@ -98,24 +100,34 @@ class DeepQLearningAgent:
                 if done:
                     expr = self.builder.build_expression()
                     print(f"Evaluating: {expr}")
-                    ir, ic, price_corr = self.env.evaluate_factor(expr)
-                    
-                    # Penalize high correlation with raw price (un-normalized factors)
-                    is_correlated = abs(price_corr) > 0.6
 
-                    if ir > best_ir and not is_correlated:
-                        best_ir = ir
-                        best_ic = ic # Update best IC
-                        best_factor = expr
-                        print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | Corr: {price_corr:.4f} | {expr}")
+                    if not self.validator.validate(expr):
+                        # 如果物理量纲错误 (如 Price + Volume)
+                        print(f"Invalid Logic (Type Mismatch): {expr}")
+                        reward = -10.0 # 给一个较重的惩罚，告诉它不要这样做
+                        
+                        # 重要：直接跳过 evaluate_factor，节省时间
+                        ir, ic, price_corr = -1.0, -1.0, 1.0
 
-                    # Reward Engineering
-                    if is_correlated:
-                        reward = -10.0 # Heavy penalty for just mimicking price
-                    elif ir > 0:
-                        reward = ir * 10 # Amplify positive IR
                     else:
-                        reward = -1 # Penalty for bad factor or error
+                        ir, ic, price_corr = self.env.evaluate_factor(expr)
+                        
+                        # Penalize high correlation with raw price (un-normalized factors)
+                        is_correlated = abs(price_corr) > 0.6
+
+                        if ir > best_ir and not is_correlated:
+                            best_ir = ir
+                            best_ic = ic # Update best IC
+                            best_factor = expr
+                            print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | Corr: {price_corr:.4f} | {expr}")
+
+                        # Reward Engineering
+                        if is_correlated:
+                            reward = -10.0 # Heavy penalty for just mimicking price
+                        elif ir > 0:
+                            reward = ir * 10 # Amplify positive IR
+                        else:
+                            reward = -10 # Penalty for bad factor or error
                 
                 self.memory.append((state, action, reward, next_state, done))
                 state = next_state
