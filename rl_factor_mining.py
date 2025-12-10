@@ -21,4 +21,4 @@ if __name__ == "__main__":
     
     # 开始训练
     # 建议增加 episodes 数量以获得更好的结果
-    agent.train(episodes=100)
+    agent.train()

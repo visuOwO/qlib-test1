@@ -78,25 +78,35 @@ class DeepQLearningAgent:
         loss.backward()
         self.optimizer.step()
 
-    def train(self, episodes=50):
-        print(f"\n--- Starting Deep Q-Learning Factor Mining ({episodes} Episodes) ---")
+    def train(self, target_valid_episodes=50, max_attempts=1000):
+        """
+        target_valid_episodes: 希望生成的【合法】因子数量
+        max_attempts: 最大尝试次数（防止模型太笨一直死循环）
+        """
+        print(f"\n--- Starting Deep Q-Learning (Target: {target_valid_episodes} Valid Factors) ---")
         best_ir = -float('inf')
         best_ic = -float('inf') # Track best IC as well
         best_factor = ""
+
+        valid_count = 0    # 记录生成了多少个合法因子
+        total_attempts = 0 # 记录总共尝试了多少次
         
-        for e in range(episodes):
+        while valid_count < target_valid_episodes and total_attempts < max_attempts:
             state = self.builder.reset()
-            total_reward = 0
+            total_attempts += 1
+
+            # 临时变量
+            episode_reward = 0
             done = False
             
             while not done:
                 valid_actions = self.builder.get_valid_actions()
                 action = self.select_action(state, valid_actions)
-                
                 next_state, done = self.builder.step(action)
                 
                 # Intermediate reward is 0, final reward depends on factor evaluation
                 reward = 0
+
                 if done:
                     expr = self.builder.build_expression()
                     print(f"Evaluating: {expr}")
@@ -110,6 +120,8 @@ class DeepQLearningAgent:
                         ir, ic, price_corr = -1.0, -1.0, 1.0
 
                     else:
+                        print(f"Attempt {total_attempts} (Valid #{valid_count+1}): {expr}")
+
                         ir, ic, price_corr = self.env.evaluate_factor(expr)
                         
                         # Penalize high correlation with raw price (un-normalized factors)
@@ -123,29 +135,29 @@ class DeepQLearningAgent:
 
                         # Reward Engineering
                         if is_correlated:
-                            reward = -10.0 # Heavy penalty for just mimicking price
+                            reward = -5.0 # Heavy penalty for just mimicking price
                         elif ir > 0:
-                            reward = ir * 10 # Amplify positive IR
+                            reward = ir * 20 # Amplify positive IR
                         else:
-                            reward = -10 # Penalty for bad factor or error
+                            reward = -1.0 # Penalty for bad factor or error
+
+                        valid_count += 1
                 
                 self.memory.append((state, action, reward, next_state, done))
                 state = next_state
-                total_reward += reward
+                episode_reward += reward
                 
                 self.optimize_model()
 
-            # Update Target Network
-            if e % 5 == 0:
-                self.target_net.load_state_dict(self.policy_net.state_dict())
-
-            # Decay Epsilon
+            # Epsilon Decay (可以按尝试次数衰减，也可以按有效次数衰减，这里按尝试次数)
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-            
-            if (e+1) % 5 == 0:
-                print(f"Episode {e+1}/{episodes} | Epsilon: {self.epsilon:.2f} | Last Reward: {total_reward:.4f}")
+
+            if total_attempts % 10 == 0:
+                print(f"Progress: {valid_count}/{target_valid_episodes} Valid Factors | Total Attempts: {total_attempts} | Epsilon: {self.epsilon:.2f}")
 
         print("\n--- Training Complete ---")
+        print(f"Total Attempts: {total_attempts}")
+        print(f"Valid Factors Generated: {valid_count}")
         print(f"Best Factor: {best_factor}")
         print(f"Best IR: {best_ir:.4f}")
         print(f"Best IC: {best_ic:.4f}")
