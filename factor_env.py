@@ -43,22 +43,33 @@ class FactorMiningEnv:
     def evaluate_factor(self, factor_expression: str) -> tuple:
         try:
             target_df = self._get_target_data()
-            if target_df.empty: return -1.0, -1.0
+            if target_df.empty: return -1.0, -1.0, 1.0
 
+            # Fetch Factor AND Close price for correlation check
             factor_df = D.features(
                 D.instruments("all"),
-                [factor_expression],
+                [factor_expression, "$close"],
                 start_time=self.start_date,
                 end_time=self.end_date,
                 freq="day"
             )
 
-            if factor_df.empty: return -1.0, -1.0
+            if factor_df.empty: return -1.0, -1.0, 1.0
 
             target_df.columns = ['target'] 
+            # factor_df has 2 columns: factor_expression and $close
+            # We merge them.
             merged_df = pd.merge(factor_df, target_df, left_index=True, right_index=True, how='inner')
             merged_df.dropna(inplace=True)
-            if merged_df.empty: return -1.0, -1.0
+            if merged_df.empty: return -1.0, -1.0, 1.0
+
+            # Calculate Price Correlation (Spearman)
+            # High correlation with price (un-normalized) is bad.
+            price_corr_series = merged_df.groupby(level='datetime').apply(
+                lambda x: x[factor_expression].corr(x['$close'], method='spearman')
+            )
+            price_corr = price_corr_series.mean()
+            if np.isnan(price_corr): price_corr = 1.0
 
             # IC
             ic_series = merged_df.groupby(level='datetime').apply(
@@ -76,7 +87,7 @@ class FactorMiningEnv:
                     return pd.Series()
 
             daily_group_returns = merged_df.groupby(level='datetime').apply(get_group_return)
-            if 4 not in daily_group_returns.columns: return -1.0, ic
+            if 4 not in daily_group_returns.columns: return -1.0, ic, price_corr
 
             long_ret = daily_group_returns[4]
             if self.benchmark_ret.empty:
@@ -94,7 +105,8 @@ class FactorMiningEnv:
                 ir = (mean_excess / std_excess) * np.sqrt(252)
                 if np.isnan(ir): ir = -1.0
             
-            return ir, ic
+            return ir, ic, price_corr
 
         except Exception as e:
-            return -1.0, -1.0
+            # print(f"Evaluation Error: {e}")
+            return -1.0, -1.0, 1.0

@@ -24,6 +24,10 @@ class FactorBuilder:
         # Added: Delta
         self.ops_unary_off = ["Ref", "Delta"] 
         
+        # Unary Ops needing NO extra parameter (Simple)
+        # Added: Rank, Abs, Log, Sign
+        self.ops_unary_simple = ["Rank", "Abs", "Log", "Sign"]
+
         self.windows = [5, 10, 20, 60]
         self.offsets = [1, 5, 10]
         
@@ -32,6 +36,7 @@ class FactorBuilder:
         self.action_map.extend([(op, 'BINARY') for op in self.ops_binary])
         self.action_map.extend([(op, 'UNARY_WIN') for op in self.ops_unary_win])
         self.action_map.extend([(op, 'UNARY_OFF') for op in self.ops_unary_off])
+        self.action_map.extend([(op, 'UNARY_SIMPLE') for op in self.ops_unary_simple])
         self.action_map.extend([(f, 'FEATURE') for f in self.features])
         self.action_map.extend([(i, 'INT') for i in set(self.windows + self.offsets)])
         
@@ -74,7 +79,7 @@ class FactorBuilder:
                         valid_indices.append(idx)
                 else:
                     # Can pick Operators OR Features
-                    if kind in ['BINARY', 'UNARY_WIN', 'UNARY_OFF', 'FEATURE']:
+                    if kind in ['BINARY', 'UNARY_WIN', 'UNARY_OFF', 'UNARY_SIMPLE', 'FEATURE']:
                         valid_indices.append(idx)
             
             elif req_type == self.TYPE_FEATURE:
@@ -107,6 +112,9 @@ class FactorBuilder:
         elif kind in ['UNARY_WIN', 'UNARY_OFF']:
             # Needs 1 argument + 1 int
             self.stack.append((self.TYPE_INT, depth))
+            self.stack.append((self.TYPE_OP, depth + 1))
+        elif kind == 'UNARY_SIMPLE':
+            # Needs 1 argument only
             self.stack.append((self.TYPE_OP, depth + 1))
         elif kind == 'FEATURE':
             # Terminal
@@ -144,6 +152,9 @@ class FactorBuilder:
                     arg = _recurse()
                     param = _recurse() # The INT
                     return f"{token}({arg}, {param})"
+                elif token in self.ops_unary_simple:
+                    arg = _recurse()
+                    return f"{token}({arg})"
                 else:
                     # Feature
                     return token

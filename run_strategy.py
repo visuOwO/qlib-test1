@@ -59,6 +59,31 @@ def run_workflow():
                             "fit_end_time": TRAIN_END,
                             # 关键点：使用 "all" 代表所有本地数据
                             "instruments": "all",
+                            
+                            # === 核心修改：添加数据预处理 (Standardization) ===
+                            # infer_processors: 用于处理因子数据 (X)
+                            "infer_processors": [
+                                # 1. 鲁棒的 Z-Score 标准化 (去极值 + 标准化)
+                                # fit_start_time 和 fit_end_time 决定了用哪段时间的数据来计算统计量
+                                # 但对于 CSZScore (截面)，它只看当天，所以时间段不敏感
+                                {"class": "RobustZScore", "kwargs": {"fit_start_time": TRAIN_START, "fit_end_time": TRAIN_END, "clip_outlier": True}},
+
+                                # 2. 缺失值填充 (这一点也很重要，否则 LightGBM 可能会处理不好 NaN)
+                                {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+                            ],
+
+                            # learn_processors: 用于处理标签数据 (Y, 即收益率)
+                            # 预测目标通常也需要截面标准化，这能消除大盘涨跌的影响，让模型专注于选股(Alpha)
+                            "learn_processors": [
+                                # drop_label: 如果某天收益率缺失，就不训练这条数据
+                                {"class": "DropnaLabel"},
+                    
+                                # CSRankNorm: 把收益率转换成排名 (0~1之间)
+                                # 这样模型预测的就是“排名”而不是“具体涨了多少点”
+                                # 在 A 股这种波动巨大的市场，预测排名的效果远好于预测绝对收益
+                                {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
+                            ],
+                            # ===============================================
                         },
                     },
                     "segments": {

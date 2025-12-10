@@ -79,6 +79,7 @@ class DeepQLearningAgent:
     def train(self, episodes=50):
         print(f"\n--- Starting Deep Q-Learning Factor Mining ({episodes} Episodes) ---")
         best_ir = -float('inf')
+        best_ic = -float('inf') # Track best IC as well
         best_factor = ""
         
         for e in range(episodes):
@@ -96,16 +97,22 @@ class DeepQLearningAgent:
                 reward = 0
                 if done:
                     expr = self.builder.build_expression()
-                    # print(f"Evaluating: {expr}")
-                    ir, ic = self.env.evaluate_factor(expr)
+                    print(f"Evaluating: {expr}")
+                    ir, ic, price_corr = self.env.evaluate_factor(expr)
                     
-                    if ir > best_ir:
+                    # Penalize high correlation with raw price (un-normalized factors)
+                    is_correlated = abs(price_corr) > 0.6
+
+                    if ir > best_ir and not is_correlated:
                         best_ir = ir
+                        best_ic = ic # Update best IC
                         best_factor = expr
-                        print(f"New Best! IR: {best_ir:.4f} | {expr}")
+                        print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | Corr: {price_corr:.4f} | {expr}")
 
                     # Reward Engineering
-                    if ir > 0:
+                    if is_correlated:
+                        reward = -10.0 # Heavy penalty for just mimicking price
+                    elif ir > 0:
                         reward = ir * 10 # Amplify positive IR
                     else:
                         reward = -1 # Penalty for bad factor or error
@@ -129,3 +136,4 @@ class DeepQLearningAgent:
         print("\n--- Training Complete ---")
         print(f"Best Factor: {best_factor}")
         print(f"Best IR: {best_ir:.4f}")
+        print(f"Best IC: {best_ic:.4f}")
