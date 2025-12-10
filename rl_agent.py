@@ -90,6 +90,9 @@ class DeepQLearningAgent:
 
         valid_count = 0    # 记录生成了多少个合法因子
         total_attempts = 0 # 记录总共尝试了多少次
+
+        # 用于记录历史生成过的公式
+        seen_factors = set()
         
         while valid_count < target_valid_episodes and total_attempts < max_attempts:
             state = self.builder.reset()
@@ -111,17 +114,25 @@ class DeepQLearningAgent:
                     expr = self.builder.build_expression()
                     print(f"Evaluating: {expr}")
 
+                    # 1. 语法校验
                     if not self.validator.validate(expr):
                         # 如果物理量纲错误 (如 Price + Volume)
                         print(f"Invalid Logic (Type Mismatch): {expr}")
                         reward = -10.0 # 给一个较重的惩罚，告诉它不要这样做
-                        
-                        # 重要：直接跳过 evaluate_factor，节省时间
-                        ir, ic, price_corr = -1.0, -1.0, 1.0
+
+                    # 2. 重复性校验
+                    elif expr in seen_factors:
+                        # 如果生成了重复的因子（比如第100次生成 $turnover_rate）
+                        # 给予微小的惩罚，告诉它“这个我要过了，换个新的”
+                        # print(f"Duplicate Factor: {expr}")
+                        reward = -5.0
 
                     else:
+                        # 这是一个全新的、合法的因子
+                        seen_factors.add(expr) # 加入已见集合
                         print(f"Attempt {total_attempts} (Valid #{valid_count+1}): {expr}")
-
+                        
+                        # 3. 只有全新的因子才去跑回测
                         ir, ic, price_corr = self.env.evaluate_factor(expr)
                         
                         # Penalize high correlation with raw price (un-normalized factors)
@@ -137,11 +148,11 @@ class DeepQLearningAgent:
                         if is_correlated:
                             reward = -5.0 # Heavy penalty for just mimicking price
                         elif ir > 0:
+                            print(f"Valid & New: {expr} | IC: {ic:.4f}")
+                            valid_count += 1
                             reward = ir * 20 # Amplify positive IR
                         else:
                             reward = -1.0 # Penalty for bad factor or error
-
-                        valid_count += 1
                 
                 self.memory.append((state, action, reward, next_state, done))
                 state = next_state

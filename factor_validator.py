@@ -94,7 +94,7 @@ class FactorValidator:
                 # 但严格禁止 Price + Volume
                 if {t1, t2} == {FactorType.PRICE, FactorType.VOLUME}:
                     return FactorType.ERROR 
-                return t1 # 宽松处理其他情况
+                return FactorType.ERROR
 
             # 规则 B: 乘法 (Mul)
             if func_name == 'Mul':
