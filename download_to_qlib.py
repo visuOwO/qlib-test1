@@ -49,7 +49,8 @@ def process_single_stock(pro, ts_code, start_date, end_date):
         df_factor = pro.adj_factor(ts_code=ts_code, start_date=start_date, end_date=end_date)
         
         # 3. 获取基础指标 (含换手率) - turnover_rate 为百分比
-        df_basic = pro.daily_basic(ts_code=ts_code, start_date=start_date, end_date=end_date, fields='trade_date,turnover_rate')
+        fields = 'trade_date,turnover_rate,turnover_rate_f,volume_ratio,pe_ttm,pb,ps_ttm,dv_ttm,total_mv,circ_mv'
+        df_basic = pro.daily_basic(ts_code=ts_code, start_date=start_date, end_date=end_date, fields=fields)
         
         if df_daily.empty or df_factor.empty:
             return None
@@ -83,6 +84,20 @@ def process_single_stock(pro, ts_code, start_date, end_date):
         # 换手率 (百分比)，可能存在缺失
         if 'turnover_rate' in df_merge.columns:
             data['turnover_rate'] = df_merge['turnover_rate']
+
+        # 估值类
+        data['pe_ttm'] = df_merge['pe_ttm']
+        data['pb'] = df_merge['pb']
+        data['ps_ttm'] = df_merge['ps_ttm']
+        data['dv_ttm'] = df_merge['dv_ttm']
+
+        # 情绪类
+        data['turnover_rate_f'] = df_merge['turnover_rate_f']
+        data['volume_ratio'] = df_merge['volume_ratio']
+        
+        # 市值类 (注意单位转换：Tushare 给的是万元，建议转为元)
+        data['total_mv'] = df_merge['total_mv'] * 10000 
+        data['circ_mv'] = df_merge['circ_mv'] * 10000
         
         # 必须按日期升序排列
         data = data.sort_values('date').reset_index(drop=True)

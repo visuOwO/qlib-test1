@@ -16,8 +16,10 @@ class FactorMiningEnv:
         self.end_date = end_date
         self.benchmark_code = benchmark_code
         self.raw_features = [
-            "$open", "$high", "$low", "$close", "$volume", 
-            "$amount", "$turnover_rate"
+            "$open", "$high", "$low", "$close", "$volume", "$amount", 
+            "$turnover_rate", "$turnover_rate_f", "$volume_ratio",
+            "$pe_ttm", "$pb", "$ps_ttm", "$dv_ttm",
+            "$total_mv", "$circ_mv"
         ]
         self.benchmark_ret = self._get_benchmark_return()
 
