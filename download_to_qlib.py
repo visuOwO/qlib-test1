@@ -4,6 +4,7 @@ import os
 import time
 from pathlib import Path
 from token_manager import get_valid_token
+import numpy as np
 
 # ================= 配置区域 =================
 # 1. 请替换为您的 Tushare Token
@@ -36,7 +37,16 @@ def get_stock_list(pro):
     print(f"获取到 {len(stock_list)} 只股票。")
     return stock_list
 
-def process_single_stock(pro, ts_code, start_date, end_date):
+# 预先加载行业映射
+def get_industry_map(pro):
+    # 获取基础信息，包含行业 (industry) 或申万行业 (sw_l1)
+    df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,industry')
+    
+    # 将字符串行业转换为 ID (0, 1, 2...)
+    df['industry_id'] = pd.factorize(df['industry'])[0]
+    return df.set_index('ts_code')['industry_id'].to_dict()
+
+def process_single_stock(pro, ts_code, start_date, end_date, industry_map):
     """
     下载单个股票数据并格式化
     Qlib 要求的 CSV 格式: [date, open, high, low, close, volume, amount, factor]
@@ -44,6 +54,11 @@ def process_single_stock(pro, ts_code, start_date, end_date):
     try:
         # 1. 获取日线行情 (Open, High, Low, Close, Vol, Amount)
         df_daily = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+        # 写入行业 ID
+        # 注意：行业 ID 是静态的，每天都一样，存为 float
+        ind_id = industry_map.get(ts_code, np.nan)
+        print(ind_id)
         
         # 2. 获取复权因子 (Adj Factor) - Qlib 需要这个来计算后复权价
         df_factor = pro.adj_factor(ts_code=ts_code, start_date=start_date, end_date=end_date)
@@ -66,6 +81,8 @@ def process_single_stock(pro, ts_code, start_date, end_date):
         # Qlib:    date, open, high, low, close, volume, amount, factor
         
         data = pd.DataFrame()
+        data['industry'] = [ind_id] * len(df_merge)
+
         data['date'] = pd.to_datetime(df_merge['trade_date'])
         data['open'] = df_merge['open']
         data['high'] = df_merge['high']
@@ -153,11 +170,14 @@ def process_index_data(pro, ts_code, start_date, end_date):
 def main():
     pro = init_tushare()
     ensure_dir(CSV_OUTPUT_DIR)
+
+    # 1. 获取行业映射
+    industry_map = get_industry_map(pro)
     
     stock_list = get_stock_list(pro)
     
     # 限制 Demo 数量，防止 Tushare 触发流控 (如果您的积分够高，可以去掉 [:50])
-    target_stocks = stock_list[:50] 
+    target_stocks = stock_list
     print(f"开始下载 {len(target_stocks)} 只股票数据...")
     
     success_count = 0
@@ -175,7 +195,7 @@ def main():
             success_count += 1
             continue
             
-        df = process_single_stock(pro, ts_code, START_DATE, END_DATE)
+        df = process_single_stock(pro, ts_code, START_DATE, END_DATE, industry_map)
         
         if df is not None and not df.empty:
             # 保存为 CSV

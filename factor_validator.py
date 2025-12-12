@@ -232,10 +232,13 @@ class FactorValidator:
             # 规则 E: 时序函数与窗口检查 (分拆逻辑)
             
             # 1. 聚合类函数: Window=1 是废话 (等于自身)
-            if func_name in ['Mean', 'EMA', 'WMA', 'Max', 'Min', 'Sum']:
+            if func_name in ['Mean', 'EMA', 'WMA', 'Max', 'Min', 'Sum', 'Rank']:
                 window_node = args[1]
                 if isinstance(window_node, ast.Constant) and window_node.value == 1:
                     return FactorType.ERROR
+                # Rank($close, 10) -> RATIO (百分比)
+                if func_name == 'Rank':
+                    return FactorType.RATIO_PCT
                 return arg_types[0] # 保持输入类型
 
             # 2. 统计类函数: Window < 2 无法计算 (方差/斜率至少要2个点)
@@ -273,7 +276,7 @@ class FactorValidator:
                 return t
 
             # G. 去量纲函数
-            if func_name in ['Rank', 'Correlation', 'Sign']:
+            if func_name in ['Correlation', 'Sign']:
                 # Sign 拦截绝对值
                 if func_name == 'Sign' and arg_types[0] in [FactorType.PRICE_ABS, FactorType.VOLUME_ABS]:
                     return FactorType.ERROR
@@ -304,5 +307,8 @@ if __name__ == "__main__":
     print(f"Check {expr2}: {v.validate(expr2)}") # 应为 True
     
     # 案例 3: 正确 (价+价)
-    expr3 = "Add($close, $open)"
+    expr3 = "Rank($pe, 2)"
     print(f"Check {expr3}: {v.validate(expr3)}") # 应为 True
+
+    expr4 = "$ps_ttm"
+    print(f"Check {expr4}: {v.validate(expr4)}") # 应为 True

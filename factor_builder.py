@@ -17,16 +17,16 @@ class FactorBuilder:
         self.ops_binary = ["Add", "Sub", "Mul", "Div"]
         
         # Unary Ops needing a Window (Int)
-        # Added: Slope, EMA, WMA, ROC (Rate of Change)
-        self.ops_unary_win = ["Mean", "Std", "Max", "Min", "Slope", "EMA", "WMA", "ROC"] 
+        # Added: Slope, EMA, WMA, ROC (Rate of Change), Rank
+        self.ops_unary_win = ["Mean", "Std", "Max", "Min", "Slope", "EMA", "WMA", "Rank"] 
         
         # Unary Ops needing an Offset (Int)
         # Added: Delta
         self.ops_unary_off = ["Ref", "Delta"] 
         
         # Unary Ops needing NO extra parameter (Simple)
-        # Added: Rank, Abs, Log, Sign
-        self.ops_unary_simple = ["Rank", "Abs", "Log", "Sign"]
+        # Added: Abs, Log, Sign
+        self.ops_unary_simple = ["Abs", "Log", "Sign"]
 
         self.windows = [5, 10, 20, 60]
         self.offsets = [1, 5, 10]
