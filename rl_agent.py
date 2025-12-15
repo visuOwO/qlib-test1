@@ -6,9 +6,10 @@ import numpy as np
 import collections
 import concurrent.futures
 import os
+import time
 from factor_builder import FactorBuilder
 from factor_validator import FactorValidator
-from factor_env import evaluate_factor_mp
+from factor_env import evaluate_factor_mp, init_worker
 from dqn_model import DQN, RNN_DQN
 
 class DeepQLearningAgent:
@@ -95,12 +96,20 @@ class DeepQLearningAgent:
         seen_factors = set()
         pending_futures = {}  # future -> (state, action, next_state, done, expr)
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=init_worker,  # 指定初始化函数
+            initargs=(self.env.provider_uri, self.env.start_date, self.env.end_date, self.env.benchmark_code) # 传递参数
+        ) as executor:
+            
             while valid_count < target_valid_episodes and total_attempts < max_attempts:
                 
                 # --- 1. Process Completed Futures ---
                 # Check for completed futures without blocking
                 completed_futures = [f for f in pending_futures if f.done()]
+                if completed_futures:
+                    did_work = True # 有任务完成
+                
                 for future in completed_futures:
                     state, action, next_state, done, expr = pending_futures.pop(future)
                     
@@ -133,6 +142,7 @@ class DeepQLearningAgent:
 
                 # --- 2. Generate New Factors if Pool has Capacity ---
                 while len(pending_futures) < num_workers and total_attempts < max_attempts:
+                    did_work = True # 提交了新任务
                     state = self.builder.reset()
                     total_attempts += 1
                     
@@ -164,9 +174,7 @@ class DeepQLearningAgent:
                                     evaluate_factor_mp, 
                                     expr, 
                                     self.env.start_date, 
-                                    self.env.end_date, 
-                                    self.env.benchmark_code, 
-                                    self.env.provider_uri
+                                    self.env.end_date
                                 )
                                 pending_futures[future] = (temp_state, action, next_temp_state, done, expr)
                         
@@ -179,6 +187,9 @@ class DeepQLearningAgent:
                 if total_attempts % 10 == 0 and total_attempts > 0:
                     self.target_net.load_state_dict(self.policy_net.state_dict())
                     print(f"Progress: {valid_count}/{target_valid_episodes} Valid | Attempts: {total_attempts} | Pending: {len(pending_futures)} | Epsilon: {self.epsilon:.2f}")
+
+                if not did_work:
+                    time.sleep(0.1)
 
         print("\n--- Training Complete ---")
         print(f"Total Attempts: {total_attempts}")

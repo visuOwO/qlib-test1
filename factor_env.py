@@ -5,28 +5,54 @@ import traceback
 from qlib.data import D
 from qlib.config import C
 
-# This is the new multiprocessing-safe evaluation function
-def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str, benchmark_code: str, provider_uri: str) -> tuple:
+_WORKER_CACHE = {}
+
+def init_worker(provider_uri, start_date, end_date, benchmark_code):
     """
-    A self-contained, multiprocessing-safe function to evaluate a factor expression.
-    It initializes Qlib within the process.
+    子进程初始化函数：只运行一次
+    负责初始化 Qlib 并加载公共数据到全局变量
     """
     try:
-        # 1. Initialize Qlib for this worker process
         if not C.get("initialized", False):
             qlib.init(provider_uri=provider_uri, region=qlib.constant.REG_CN)
-
-        # 2. Get benchmark return
-        benchmark_ret_df = D.features([benchmark_code], ["Ref($close, -1)/$close - 1"], start_date, end_date)
-        if not benchmark_ret_df.empty and isinstance(benchmark_ret_df.index, pd.MultiIndex):
-            benchmark_ret_df = benchmark_ret_df.droplevel(0)
-
-        # 3. Get target data (future returns)
+        
+        # 1. 预加载基准收益
+        bench_df = D.features([benchmark_code], ["Ref($close, -1)/$close - 1"], start_date, end_date)
+        if not bench_df.empty and isinstance(bench_df.index, pd.MultiIndex):
+            bench_df = bench_df.droplevel(0)
+            
+        # 2. 预加载目标收益 (Target)
         target_df = D.features(D.instruments("all"), ["Ref($close, -1)/$close - 1"], start_time=start_date, end_time=end_date, freq="day")
-        if target_df.empty: return -1.0, -1.0, 1.0
+        target_df.columns = ['target']
+        
+        # 3. 预加载基础行情 (可选，用于计算相关性，防止每次都去读 $close)
+        # 这里我们至少可以把 target 和 benchmark 存起来
+        _WORKER_CACHE['benchmark_ret'] = bench_df
+        _WORKER_CACHE['target_df'] = target_df
+        
+        print(f"[Worker] Initialized with Target Data shape: {target_df.shape}")
+        
+    except Exception as e:
+        print(f"[Worker Init Error] {e}")
+        traceback.print_exc()
 
-        # 4. Get factor data
+def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -> tuple:
+    """
+    优化后的评估函数：使用 _WORKER_CACHE
+    注意：参数减少了，因为部分数据在 init_worker 里加载了
+    """
+    try:
+        # 从全局缓存获取数据
+        target_df = _WORKER_CACHE.get('target_df')
+        benchmark_ret_df = _WORKER_CACHE.get('benchmark_ret')
+        
+        if target_df is None or target_df.empty:
+            return -1.0, -1.0, 1.0
+
+        # 4. Get factor data (因子数据必须动态计算)
         try:
+            # 注意：这里我们依然需要 $close 和 $industry
+            # Qlib 的 D.features 会处理对齐，所以这里重新读取 $close 开销是可以接受的，或者也可以进一步优化缓存
             factor_df = D.features(
                 D.instruments("all"),
                 [factor_expression, "$close", "$industry"], 
@@ -35,7 +61,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str, b
                 freq="day"
             )
         except Exception as e:
-            # This can happen if the expression is invalid for Qlib
+            # 公式错误等情况
             return -1.0, -1.0, 1.0
 
         if factor_df.empty: return -1.0, -1.0, 1.0
@@ -43,12 +69,16 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str, b
         if 'SH000300' in factor_df.index.get_level_values('instrument'):
             factor_df = factor_df.drop('SH000300', level='instrument')
 
-        # 5. Data merging and cleaning
-        target_df.columns = ['target']
+        # 5. Merge (使用缓存的 target_df)
         merged_df = pd.merge(factor_df, target_df, left_index=True, right_index=True, how='inner')
         merged_df.dropna(inplace=True)
+        
         if merged_df.empty: return -1.0, -1.0, 1.0
 
+        # ... (后续计算逻辑保持不变: Correlation, Neutralization, IC, IR) ...
+        # ... 请保留您原有的计算逻辑 ...
+        
+        # 为了演示完整性，这里简写后续部分，请将您原来的代码逻辑填回此处
         # 6. Price Correlation Check
         price_corr_series = merged_df.groupby(level='datetime').apply(
             lambda x: x[factor_expression].corr(x['$close'], method='spearman')
@@ -80,6 +110,16 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str, b
         
         daily_group_returns = merged_df.groupby(level='datetime').apply(get_group_return)
         
+        if isinstance(daily_group_returns, pd.Series):
+            if isinstance(daily_group_returns.index, pd.MultiIndex):
+                # 情况 1: 结果是 MultiIndex Series (datetime, group) -> Unstack 展开为 DataFrame
+                daily_group_returns = daily_group_returns.unstack()
+            else:
+                # 情况 2: 结果是单日数据，Index 只是 group (0, 1, 2...) -> 转为单行 DataFrame
+                # 这种情况下 Series 的 name 可能是 datetime，转置后变为 index
+                daily_group_returns = daily_group_returns.to_frame().T
+        
+        # 此时 daily_group_returns 必定是 DataFrame，可以安全访问 .columns
         if 4 not in daily_group_returns.columns: 
             return -1.0, ic, price_corr
 
@@ -103,7 +143,8 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str, b
         return ir, ic, price_corr
 
     except Exception:
-        # Broad exception to catch any other errors during evaluation
+        # 建议打印错误堆栈，否则调试困难
+        traceback.print_exc() 
         return -1.0, -1.0, 1.0
 
 
