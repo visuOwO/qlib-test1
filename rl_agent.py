@@ -4,8 +4,11 @@ import torch.nn.functional as F
 import random
 import numpy as np
 import collections
+import concurrent.futures
+import os
 from factor_builder import FactorBuilder
 from factor_validator import FactorValidator
+from factor_env import evaluate_factor_mp
 from dqn_model import DQN, RNN_DQN
 
 class DeepQLearningAgent:
@@ -77,93 +80,105 @@ class DeepQLearningAgent:
         loss.backward()
         self.optimizer.step()
 
-    def train(self, target_valid_episodes=50, max_attempts=1000):
-        """
-        target_valid_episodes: 希望生成的【合法】因子数量
-        max_attempts: 最大尝试次数（防止模型太笨一直死循环）
-        """
-        print(f"\n--- Starting Deep Q-Learning (Target: {target_valid_episodes} Valid Factors) ---")
-        best_ir = -float('inf')
-        best_ic = -float('inf') # Track best IC as well
-        best_factor = ""
-
-        valid_count = 0    # 记录生成了多少个合法因子
-        total_attempts = 0 # 记录总共尝试了多少次
-
-        # 用于记录历史生成过的公式
-        seen_factors = set()
+    def train(self, target_valid_episodes=50, max_attempts=1000, num_workers=None):
+        if num_workers is None:
+            num_workers = os.cpu_count()
         
-        while valid_count < target_valid_episodes and total_attempts < max_attempts:
-            state = self.builder.reset()
-            total_attempts += 1
+        print(f"\n--- Starting Parallel Deep Q-Learning (Target: {target_valid_episodes} Valid Factors, Workers: {num_workers}) ---")
+        
+        best_ir = -float('inf')
+        best_ic = -float('inf')
+        best_factor = ""
+        valid_count = 0
+        total_attempts = 0
+        
+        seen_factors = set()
+        pending_futures = {}  # future -> (state, action, next_state, done, expr)
 
-            # 临时变量
-            episode_reward = 0
-            done = False
-            
-            while not done:
-                valid_actions = self.builder.get_valid_actions()
-                action = self.select_action(state, valid_actions)
-                next_state, done = self.builder.step(action)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            while valid_count < target_valid_episodes and total_attempts < max_attempts:
                 
-                # Intermediate reward is 0, final reward depends on factor evaluation
-                reward = 0
-
-                if done:
-                    expr = self.builder.build_expression()
-                    # print(f"Evaluating: {expr}")
-
-                    # 1. 语法校验
-                    if not self.validator.validate(expr):
-                        # 如果物理量纲错误 (如 Price + Volume)
-                        # print(f"Invalid Logic (Type Mismatch): {expr}")
-                        reward = -10.0 # 给一个较重的惩罚，告诉它不要这样做
-
-                    # 2. 重复性校验
-                    elif expr in seen_factors:
-                        # 如果生成了重复的因子（比如第100次生成 $turnover_rate）
-                        # 给予微小的惩罚，告诉它“这个我要过了，换个新的”
-                        # print(f"Duplicate Factor: {expr}")
-                        reward = -5.0
-
-                    else:
-                        # 这是一个全新的、合法的因子
-                        seen_factors.add(expr) # 加入已见集合
-                        print(f"Attempt {total_attempts} (Valid #{valid_count+1}): {expr}")
+                # --- 1. Process Completed Futures ---
+                # Check for completed futures without blocking
+                completed_futures = [f for f in pending_futures if f.done()]
+                for future in completed_futures:
+                    state, action, next_state, done, expr = pending_futures.pop(future)
+                    
+                    try:
+                        ir, ic, price_corr = future.result()
                         
-                        # 3. 只有全新的因子才去跑回测
-                        ir, ic, price_corr = self.env.evaluate_factor(expr)
-                        
-                        # Penalize high correlation with raw price (un-normalized factors)
                         is_correlated = abs(price_corr) > 0.6
 
                         if ir > best_ir and not is_correlated:
                             best_ir = ir
-                            best_ic = ic # Update best IC
+                            best_ic = ic
                             best_factor = expr
                             print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | Corr: {price_corr:.4f} | {expr}")
 
-                        # Reward Engineering
                         if is_correlated:
-                            reward = -5.0 # Heavy penalty for just mimicking price
+                            reward = -5.0
                         elif ir > 0:
                             print(f"Valid & New: {expr} | IC: {ic:.4f}")
                             valid_count += 1
-                            reward = ir * 20 # Amplify positive IR
+                            reward = ir * 20
                         else:
-                            reward = -1.0 # Penalty for bad factor or error
-                
-                self.memory.append((state, action, reward, next_state, done))
-                state = next_state
-                episode_reward += reward
-                
-                self.optimize_model()
+                            reward = -1.0
+                            
+                    except Exception as e:
+                        print(f"Error evaluating factor {expr}: {e}")
+                        reward = -2.0 # Penalty for causing an error
 
-            # Epsilon Decay (可以按尝试次数衰减，也可以按有效次数衰减，这里按尝试次数)
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+                    self.memory.append((state, action, reward, next_state, done))
+                    self.optimize_model()
 
-            if total_attempts % 10 == 0:
-                print(f"Progress: {valid_count}/{target_valid_episodes} Valid Factors | Total Attempts: {total_attempts} | Epsilon: {self.epsilon:.2f}")
+                # --- 2. Generate New Factors if Pool has Capacity ---
+                while len(pending_futures) < num_workers and total_attempts < max_attempts:
+                    state = self.builder.reset()
+                    total_attempts += 1
+                    
+                    # Generate one full expression
+                    done = False
+                    temp_state = state
+                    while not done:
+                        valid_actions = self.builder.get_valid_actions()
+                        action = self.select_action(temp_state, valid_actions)
+                        next_temp_state, done = self.builder.step(action)
+                        
+                        if done:
+                            expr = self.builder.build_expression()
+                            
+                            # --- Pre-validation checks ---
+                            if not self.validator.validate(expr):
+                                reward = -10.0
+                                self.memory.append((temp_state, action, reward, next_temp_state, done))
+                                self.optimize_model()
+                            elif expr in seen_factors:
+                                reward = -5.0
+                                self.memory.append((temp_state, action, reward, next_temp_state, done))
+                                self.optimize_model()
+                            else:
+                                # This is a new, valid factor to be evaluated
+                                seen_factors.add(expr)
+                                print(f"Attempt {total_attempts} (Submitting for Eval): {expr}")
+                                future = executor.submit(
+                                    evaluate_factor_mp, 
+                                    expr, 
+                                    self.env.start_date, 
+                                    self.env.end_date, 
+                                    self.env.benchmark_code, 
+                                    self.env.provider_uri
+                                )
+                                pending_futures[future] = (temp_state, action, next_temp_state, done, expr)
+                        
+                        temp_state = next_temp_state
+
+                # Epsilon Decay
+                self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+                
+                # Target Network Update & Progress Print
+                if total_attempts % 10 == 0 and total_attempts > 0:
+                    self.target_net.load_state_dict(self.policy_net.state_dict())
+                    print(f"Progress: {valid_count}/{target_valid_episodes} Valid | Attempts: {total_attempts} | Pending: {len(pending_futures)} | Epsilon: {self.epsilon:.2f}")
 
         print("\n--- Training Complete ---")
         print(f"Total Attempts: {total_attempts}")
