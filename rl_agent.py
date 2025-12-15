@@ -70,7 +70,11 @@ class DeepQLearningAgent:
 
         # Compute V(s_{t+1}) for all next states.
         with torch.no_grad():
-            next_state_values = self.target_net(next_state_batch).max(1)[0].unsqueeze(1)
+            # 1. 用 Policy Net 决定哪个动作最好 (argmax)
+            next_actions = self.policy_net(next_state_batch).argmax(1).unsqueeze(1)
+            
+            # 2. 用 Target Net 计算这个动作的价值
+            next_state_values = self.target_net(next_state_batch).gather(1, next_actions)
         
         # Compute expected Q
         expected_q_values = reward_batch + (self.gamma * next_state_values * (1 - done_batch))
