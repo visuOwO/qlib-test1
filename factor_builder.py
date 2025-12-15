@@ -143,6 +143,7 @@ class FactorBuilder:
     def build_expression(self):
         """
         Reconstructs the string expression from the sequence of choices (Pre-order traversal).
+        [Modified] Applies Canonicalization (Normalization) for commutative operators (Add, Mul).
         """
         if not self.expression_parts: return ""
         
@@ -157,16 +158,27 @@ class FactorBuilder:
             # Check type of token
             if isinstance(token, str):
                 if token in self.ops_binary:
+                    # Binary Op: recursively build left and right children
                     left = _recurse()
                     right = _recurse()
+                    
+                    # 对于满足交换律的算子 (Add, Mul)，按字符串字典序重排参数
+                    # 这确保了 Add(A, B) 和 Add(B, A) 生成完全相同的字符串
+                    if token in ["Add", "Mul"]:
+                        if left > right: # 字符串比较：如果左边大于右边，则交换
+                            left, right = right, left
+
                     return f"{token}({left}, {right})"
+                
                 elif token in self.ops_unary_win + self.ops_unary_off:
                     arg = _recurse()
                     param = _recurse() # The INT
                     return f"{token}({arg}, {param})"
+                
                 elif token in self.ops_unary_simple:
                     arg = _recurse()
                     return f"{token}({arg})"
+                
                 else:
                     # Feature
                     return token
