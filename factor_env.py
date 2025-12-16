@@ -75,10 +75,6 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         
         if merged_df.empty: return -1.0, -1.0, 1.0
 
-        # ... (后续计算逻辑保持不变: Correlation, Neutralization, IC, IR) ...
-        # ... 请保留您原有的计算逻辑 ...
-        
-        # 为了演示完整性，这里简写后续部分，请将您原来的代码逻辑填回此处
         # 6. Price Correlation Check
         price_corr_series = merged_df.groupby(level='datetime').apply(
             lambda x: x[factor_expression].corr(x['$close'], method='spearman')
@@ -177,7 +173,5 @@ class FactorMiningEnv:
         return evaluate_factor_mp(
             factor_expression,
             self.start_date,
-            self.end_date,
-            self.benchmark_code,
-            self.provider_uri
+            self.end_date
         )

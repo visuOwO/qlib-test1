@@ -57,12 +57,10 @@ class FactorBuilder:
         """
         返回 历史动作序列 (定长，不足补0)
         """
-        # 复制一份历史
-        seq = list(self.action_history)
-        
+        # 预留 0 作为 padding，真实动作索引整体 +1，避免与 padding 冲突
+        seq = [a + 1 for a in self.action_history]
+
         # 截断或填充到固定长度 (Padding)
-        # 假设 0 是 padding id，所以我们的动作索引最好从 1 开始，或者单独留出 0
-        # 这里为了简单，直接补 0。注意：这要求您的 action_map 里的有效动作最好不要太依赖 0
         if len(seq) < self.max_seq_len:
             seq = seq + [0] * (self.max_seq_len - len(seq))
         else:
