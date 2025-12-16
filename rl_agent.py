@@ -107,6 +107,7 @@ class DeepQLearningAgent:
         ) as executor:
             
             while valid_count < target_valid_episodes and total_attempts < max_attempts:
+                did_work = False
                 
                 # --- 1. Process Completed Futures ---
                 # Check for completed futures without blocking
@@ -155,6 +156,7 @@ class DeepQLearningAgent:
                     temp_state = state
                     while not done:
                         valid_actions = self.builder.get_valid_actions()
+                        prev_state = temp_state
                         action = self.select_action(temp_state, valid_actions)
                         next_temp_state, done = self.builder.step(action)
                         
@@ -164,11 +166,11 @@ class DeepQLearningAgent:
                             # --- Pre-validation checks ---
                             if not self.validator.validate(expr):
                                 reward = -10.0
-                                self.memory.append((temp_state, action, reward, next_temp_state, done))
+                                self.memory.append((prev_state, action, reward, next_temp_state, done))
                                 self.optimize_model()
                             elif expr in seen_factors:
                                 reward = -5.0
-                                self.memory.append((temp_state, action, reward, next_temp_state, done))
+                                self.memory.append((prev_state, action, reward, next_temp_state, done))
                                 self.optimize_model()
                             else:
                                 # This is a new, valid factor to be evaluated
@@ -180,7 +182,11 @@ class DeepQLearningAgent:
                                     self.env.start_date, 
                                     self.env.end_date
                                 )
-                                pending_futures[future] = (temp_state, action, next_temp_state, done, expr)
+                                pending_futures[future] = (prev_state, action, next_temp_state, done, expr)
+                        else:
+                            # 中间步骤也写入经验池，以便学习构建序列
+                            self.memory.append((prev_state, action, 0.0, next_temp_state, False))
+                            self.optimize_model()
                         
                         temp_state = next_temp_state
 
