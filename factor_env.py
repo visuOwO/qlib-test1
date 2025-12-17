@@ -1,4 +1,5 @@
 import qlib
+import argparse
 import pandas as pd
 import numpy as np
 import traceback
@@ -55,7 +56,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
             # Qlib 的 D.features 会处理对齐，所以这里重新读取 $close 开销是可以接受的，或者也可以进一步优化缓存
             factor_df = D.features(
                 D.instruments("all"),
-                [factor_expression, "$close", "$industry"], 
+                [factor_expression, "$close", "$industry", "$circ_mv"], 
                 start_time=start_date,
                 end_time=end_date,
                 freq="day"
@@ -82,20 +83,74 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         price_corr = price_corr_series.mean()
         if np.isnan(price_corr): price_corr = 1.0
 
-        # 7. Industry Neutralization
-        def neutralize_func(df_group):
-            if len(df_group) < 2: return pd.Series(0, index=df_group.index)
+        # 7. Circulating Market Value Neutralization
+        merged_df['log_mkt_cap'] = np.log(merged_df['$circ_mv'] + 1)
+
+        def clip_outliers(series):
+            mean = series.mean()
+            std = series.std()
+            return series.clip(mean - 3*std, mean + 3*std)
+        
+        def regress_out_size(df_day):
+            # Y: 因子值, X: 对数市值
+            Y = df_day[factor_expression].values
+            X = df_day['log_mkt_cap'].values
+            
+            # 处理 NaN
+            valid_mask = ~np.isnan(Y) & ~np.isnan(X)
+            if np.sum(valid_mask) < 10: # 如果有效数据太少，直接填0
+                return pd.Series(0, index=df_day.index)
+            
+            Y_valid = Y[valid_mask]
+            X_valid = X[valid_mask]
+            
+            # 简单的单变量回归 slope = cov(x,y) / var(x)
+            x_mean = np.mean(X_valid)
+            y_mean = np.mean(Y_valid)
+            numerator = np.sum((X_valid - x_mean) * (Y_valid - y_mean))
+            denominator = np.sum((X_valid - x_mean) ** 2)
+            
+            if denominator == 0:
+                slope = 0
+            else:
+                slope = numerator / denominator
+                
+            intercept = y_mean - slope * x_mean
+            
+            # 计算残差
+            resid = Y - (slope * X + intercept)
+            
+            # 将残差填回对应的索引
+            return pd.Series(resid, index=df_day.index)
+        
+        # 去极值
+        merged_df['raw_factor'] = merged_df.groupby(level='datetime')[factor_expression].transform(clip_outliers)
+        merged_df['raw_factor'] = merged_df['raw_factor'].fillna(0)
+
+        # 每日市值中性化 (Regress out Size)
+        merged_df['size_neu_factor'] = merged_df.groupby(level='datetime', group_keys=False).apply(regress_out_size)
+
+        def industry_neutralize_and_standardize(df_group):
             return (df_group - df_group.mean()) / (df_group.std() + 1e-9)
 
-        merged_df['neu_factor'] = merged_df.groupby(['datetime', '$industry'])[factor_expression].transform(neutralize_func)
+        # 8. Industry Neutralization
+        merged_df['neu_factor'] = merged_df.groupby(['datetime', '$industry'])['size_neu_factor'].transform(industry_neutralize_and_standardize)
         merged_df['neu_factor'] = merged_df['neu_factor'].fillna(0)
 
-        # 8. Calculate Metrics
+        # 9. Calculate Metrics
         ic_series = merged_df.groupby(level='datetime').apply(
             lambda x: x['neu_factor'].corr(x['target'], method='spearman')
         )
-        ic = ic_series.mean()
+        ic_mean = ic_series.mean()
+        ic_std = ic_series.std()
         if np.isnan(ic): ic = -1.0
+
+        if ic_std == 0:
+            icir = 0
+        else:
+            icir = ic_mean / ic_std
+
+        t_stat = icir * np.sqrt(len(ic_series))
 
         def get_group_return(df_day):
             try:
@@ -117,7 +172,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         
         # 此时 daily_group_returns 必定是 DataFrame，可以安全访问 .columns
         if 4 not in daily_group_returns.columns: 
-            return -1.0, ic, price_corr
+            return -1.0, ic_mean, price_corr
 
         long_ret = daily_group_returns[4]
         
@@ -136,7 +191,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
             ir = (mean_excess / std_excess) * np.sqrt(252)
             if np.isnan(ir): ir = -1.0
         
-        return ir, ic, price_corr
+        return ir, ic_mean, price_corr
 
     except Exception:
         # 建议打印错误堆栈，否则调试困难
@@ -170,8 +225,32 @@ class FactorMiningEnv:
         This method now acts as a wrapper for the multiprocessing-safe function.
         It can be used for single-threaded evaluation or testing.
         """
+        if not _WORKER_CACHE:
+            init_worker(self.provider_uri, self.start_date, self.end_date, self.benchmark_code)
         return evaluate_factor_mp(
             factor_expression,
             self.start_date,
             self.end_date
         )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate a single factor expression.")
+    parser.add_argument("expression", help="Factor expression, e.g., Div($close, Ref($close, 1))")
+    parser.add_argument("--start", default="2023-01-01", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default="2024-01-01", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--benchmark", default="sh000300", help="Benchmark instrument code")
+    parser.add_argument("--provider", default="./qlib_bin_data", help="Qlib provider uri")
+    args = parser.parse_args()
+
+    init_worker(args.provider, args.start, args.end, args.benchmark)
+
+    ir, ic, price_corr = evaluate_factor_mp(args.expression, args.start, args.end)
+    print(f"Expression: {args.expression}")
+    print(f"IR: {ir:.4f}")
+    print(f"IC: {ic:.4f}")
+    print(f"Price Corr: {price_corr:.4f}")
+
+
+if __name__ == "__main__":
+    main()

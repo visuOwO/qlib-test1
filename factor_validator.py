@@ -41,6 +41,12 @@ class FactorValidator:
             '$total_mv': FactorType.VOLUME_ABS,
             '$circ_mv':  FactorType.VOLUME_ABS,
         }
+        # 细分无量纲比率的语义，防止“股息率-换手率”这类跨语义相减
+        self.ratio_semantics = {
+            '$turnover_rate': 'liquidity',
+            '$turnover_rate_f': 'liquidity',
+            '$dv_ttm': 'dividend',
+        }
 
     def validate(self, expression: str) -> bool:
         """
@@ -141,10 +147,18 @@ class FactorValidator:
             # A. 加减法 (生成 REL 或 保持类型)
             if func_name in ['Add', 'Sub']:
                 t1, t2 = arg_types[0], arg_types[1]
-                
+
                 # 严格禁止 PCT(小数) 与 MUL(大数) 相加减
                 if {t1, t2} == {FactorType.RATIO_PCT, FactorType.RATIO_MUL}:
                     return FactorType.ERROR
+
+                # 无量纲比例之间的相加减需要语义一致，否则拒绝
+                if t1 == t2 == FactorType.RATIO_PCT:
+                    s1 = self._get_ratio_semantic(args[0])
+                    s2 = self._get_ratio_semantic(args[1])
+                    # 两个原子比率语义不同，直接判为非法
+                    if s1 and s2 and s1 != s2:
+                        return FactorType.ERROR
 
                 # 同类型处理
                 if t1 == t2:
@@ -218,7 +232,6 @@ class FactorValidator:
                     return t1
 
                 return FactorType.ERROR
-
             # D. 比较 (Max, Min) - 禁止与时间比较
             if func_name in ['Max', 'Min', 'Gt', 'Lt']:
                 t1, t2 = arg_types[0], arg_types[1]
@@ -292,6 +305,15 @@ class FactorValidator:
 
         return FactorType.UNKNOWN
 
+    def _get_ratio_semantic(self, node):
+        """
+        仅在原子比率之间做相加减时使用，用于拦截跨语义的组合。
+        """
+        if isinstance(node, ast.Name):
+            origin_name = node.id.replace('V_', '$')
+            return self.ratio_semantics.get(origin_name)
+        return None
+
 # 简单测试
 if __name__ == "__main__":
     v = FactorValidator()
@@ -312,3 +334,6 @@ if __name__ == "__main__":
 
     expr4 = "$ps_ttm"
     print(f"Check {expr4}: {v.validate(expr4)}") # 应为 True
+
+    expr5 = "Sub($dv_ttm, $turnover_rate)"
+    print(f"Check {expr5}: {v.validate(expr5)}") # 应为 False，跨语义比率相减应被拦截
