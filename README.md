@@ -24,6 +24,7 @@ pip install pyqlib pandas tushare fire tqdm lightgbm matplotlib scikit-learn
 *   **`show_results.py`**: 可视化回测结果（累计收益、超额收益等）。
 *   **`qlib_lightgbm_example.py`**: 一个独立的参考脚本，展示了 Qlib 的内部结构。
 *   **`token_manager.py`**: 用于管理 Tushare API Token 的辅助工具。
+*   **`factor_env.py`**: 单因子评估工具，提供命令行接口对任意表达式进行 IR/IC/价格相关性的快速评估。
 
 ## 快速开始指南
 
@@ -75,6 +76,16 @@ python show_results.py
 ```
 
 *输出：一个 matplotlib 窗口，显示您的策略与基准的累计收益对比。*
+
+### 额外：快速评估单个因子
+
+使用 `factor_env.py` 的命令行接口，输入因子表达式即可计算 IR、IC 以及与价格的相关性：
+
+```bash
+python factor_env.py "Div($close, Ref($close, 1))" --start 2023-01-01 --end 2024-01-01 --benchmark sh000300 --provider ./qlib_bin_data
+```
+
+*提示：确保 `--provider` 指向已转换好的二进制数据目录；日期范围需覆盖到指数和股票数据。*
 
 ## 自定义
 

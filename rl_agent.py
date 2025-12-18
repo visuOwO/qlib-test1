@@ -94,6 +94,7 @@ class DeepQLearningAgent:
         best_ir = -float('inf')
         best_ic = -float('inf')
         best_factor = ""
+        best_icir = -float('inf')
         valid_count = 0
         total_attempts = 0
         
@@ -119,20 +120,21 @@ class DeepQLearningAgent:
                     state, action, next_state, done, expr = pending_futures.pop(future)
                     
                     try:
-                        ir, ic, price_corr = future.result()
+                        ir, ic, icir, price_corr = future.result()
                         
                         is_correlated = abs(price_corr) > 0.6
 
                         if ir > best_ir and not is_correlated:
                             best_ir = ir
                             best_ic = ic
+                            best_icir = icir
                             best_factor = expr
-                            print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | Corr: {price_corr:.4f} | {expr}")
+                            print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | ICIR: {icir:.4f} | Corr: {price_corr:.4f} | {expr}")
 
                         if is_correlated:
                             reward = -5.0
                         elif ir > 0:
-                            print(f"Valid & New: {expr} | IC: {ic:.4f}")
+                            print(f"Valid & New: {expr} | IC: {ic:.4f} | ICIR: {icir:.4f}")
                             valid_count += 1
                             reward = ir * 20
                         else:
@@ -207,3 +209,4 @@ class DeepQLearningAgent:
         print(f"Best Factor: {best_factor}")
         print(f"Best IR: {best_ir:.4f}")
         print(f"Best IC: {best_ic:.4f}")
+        print(f"Best ICIR: {best_icir:.4f}")

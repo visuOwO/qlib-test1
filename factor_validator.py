@@ -152,6 +152,11 @@ class FactorValidator:
                 if {t1, t2} == {FactorType.RATIO_PCT, FactorType.RATIO_MUL}:
                     return FactorType.ERROR
 
+                # 禁止价格/成交量类与任意 Ratio 混加减（防止 $turnover_rate - $close 这类跨量纲）
+                non_ratio_types = {FactorType.PRICE_ABS, FactorType.PRICE_REL, FactorType.VOLUME_ABS, FactorType.VOLUME_REL}
+                if (is_ratio(t1) and t2 in non_ratio_types) or (is_ratio(t2) and t1 in non_ratio_types):
+                    return FactorType.ERROR
+
                 # 无量纲比例之间的相加减需要语义一致，否则拒绝
                 if t1 == t2 == FactorType.RATIO_PCT:
                     s1 = self._get_ratio_semantic(args[0])
@@ -335,5 +340,5 @@ if __name__ == "__main__":
     expr4 = "$ps_ttm"
     print(f"Check {expr4}: {v.validate(expr4)}") # 应为 True
 
-    expr5 = "Sub($dv_ttm, $turnover_rate)"
+    expr5 = "Ref(Log(Sub($turnover_rate, $close)), 5)"
     print(f"Check {expr5}: {v.validate(expr5)}") # 应为 False，跨语义比率相减应被拦截

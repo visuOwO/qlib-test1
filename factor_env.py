@@ -48,7 +48,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         benchmark_ret_df = _WORKER_CACHE.get('benchmark_ret')
         
         if target_df is None or target_df.empty:
-            return -1.0, -1.0, 1.0
+            return -1.0, -1.0, -1.0, -1.0
 
         # 4. Get factor data (因子数据必须动态计算)
         try:
@@ -63,9 +63,9 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
             )
         except Exception as e:
             # 公式错误等情况
-            return -1.0, -1.0, 1.0
+            return -1.0, -1.0, -1.0, -1.0
 
-        if factor_df.empty: return -1.0, -1.0, 1.0
+        if factor_df.empty: return -1.0, -1.0, -1.0, -1.0
         
         if 'SH000300' in factor_df.index.get_level_values('instrument'):
             factor_df = factor_df.drop('SH000300', level='instrument')
@@ -74,7 +74,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         merged_df = pd.merge(factor_df, target_df, left_index=True, right_index=True, how='inner')
         merged_df.dropna(inplace=True)
         
-        if merged_df.empty: return -1.0, -1.0, 1.0
+        if merged_df.empty: return -1.0, -1.0, -1.0, -1.0
 
         # 6. Price Correlation Check
         price_corr_series = merged_df.groupby(level='datetime').apply(
@@ -143,14 +143,15 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         )
         ic_mean = ic_series.mean()
         ic_std = ic_series.std()
-        if np.isnan(ic): ic = -1.0
 
-        if ic_std == 0:
+        if np.isnan(ic_mean):
+            ic_mean = -1.0
+
+        # 计算环节出问题（如标准差为0/NaN），ICIR 置 0；其他异常会统一返回 -1
+        if ic_std == 0 or np.isnan(ic_std):
             icir = 0
         else:
             icir = ic_mean / ic_std
-
-        t_stat = icir * np.sqrt(len(ic_series))
 
         def get_group_return(df_day):
             try:
@@ -172,7 +173,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         
         # 此时 daily_group_returns 必定是 DataFrame，可以安全访问 .columns
         if 4 not in daily_group_returns.columns: 
-            return -1.0, ic_mean, price_corr
+            return -1.0, ic_mean, icir, price_corr
 
         long_ret = daily_group_returns[4]
         
@@ -191,12 +192,12 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
             ir = (mean_excess / std_excess) * np.sqrt(252)
             if np.isnan(ir): ir = -1.0
         
-        return ir, ic_mean, price_corr
+        return ir, ic_mean, icir, price_corr
 
     except Exception:
         # 建议打印错误堆栈，否则调试困难
         traceback.print_exc() 
-        return -1.0, -1.0, 1.0
+        return -1.0, -1.0, -1.0, -1.0
 
 
 class FactorMiningEnv:
@@ -245,10 +246,11 @@ def main():
 
     init_worker(args.provider, args.start, args.end, args.benchmark)
 
-    ir, ic, price_corr = evaluate_factor_mp(args.expression, args.start, args.end)
+    ir, ic, icir, price_corr = evaluate_factor_mp(args.expression, args.start, args.end)
     print(f"Expression: {args.expression}")
     print(f"IR: {ir:.4f}")
     print(f"IC: {ic:.4f}")
+    print(f"ICIR: {icir:.4f}")
     print(f"Price Corr: {price_corr:.4f}")
 
 
