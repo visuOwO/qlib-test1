@@ -210,3 +210,12 @@ class DeepQLearningAgent:
         print(f"Best IR: {best_ir:.4f}")
         print(f"Best IC: {best_ic:.4f}")
         print(f"Best ICIR: {best_icir:.4f}")
+
+        return {
+            "best_factor": best_factor,
+            "best_ir": best_ir,
+            "best_ic": best_ic,
+            "best_icir": best_icir,
+            "total_attempts": total_attempts,
+            "valid_count": valid_count,
+        }

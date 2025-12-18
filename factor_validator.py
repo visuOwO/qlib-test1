@@ -141,8 +141,11 @@ class FactorValidator:
             if func_name in ['Ref', 'Delta']:
                 if len(args) > 1 and isinstance(args[1], ast.Constant) and args[1].value < 1:
                     return FactorType.ERROR
+                # 排除 Delta(Sign(x), n) 这类无信息的“方向跳变”因子
+                if func_name == 'Delta' and isinstance(args[0], ast.Call) and getattr(args[0].func, 'id', None) == 'Sign':
+                    return FactorType.ERROR
 
-            # --- 核心算子逻辑 ---
+                # --- 核心算子逻辑 ---
             
             # A. 加减法 (生成 REL 或 保持类型)
             if func_name in ['Add', 'Sub']:
