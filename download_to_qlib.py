@@ -11,8 +11,8 @@ import numpy as np
 TS_TOKEN = get_valid_token()
 
 # 2. 设置数据范围 (建议先用短时间、少量股票测试跑通)
-START_DATE = "20220101"
-END_DATE = "20241231"
+START_DATE = "20200101"
+END_DATE = "20251031"
 
 # 3. 输出目录设置
 CSV_OUTPUT_DIR = Path("./qlib_source_csv") # 存放转换好的CSV

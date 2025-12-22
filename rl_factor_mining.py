@@ -1,4 +1,6 @@
 import torch
+import os
+from datetime import datetime
 from factor_env import FactorMiningEnv
 from rl_agent import DeepQLearningAgent
 from factor_visualization import visualize_factor
@@ -23,6 +25,27 @@ if __name__ == "__main__":
     # 开始训练
     # 建议增加 episodes 数量以获得更好的结果
     result = agent.train(target_valid_episodes=200, max_attempts=10000)
+
+    # 记录最佳因子到文件
+    os.makedirs("analysis_results", exist_ok=True)
+    summary_path = os.path.join("analysis_results", "best_factor_summary.txt")
+    with open(summary_path, "a", encoding="utf-8") as f:
+        f.write(
+            "\n".join(
+                [
+                    f"=== {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===",
+                    f"Best Factor: {result.get('best_factor', '')}",
+                    f"Best IR: {result.get('best_ir', '')}",
+                    f"Best IC: {result.get('best_ic', '')}",
+                    f"Best ICIR: {result.get('best_icir', '')}",
+                    f"Total Attempts: {result.get('total_attempts', '')}",
+                    f"Valid Factors: {result.get('valid_count', '')}",
+                    f"Train Window: {EVAL_START_DATE} ~ {EVAL_END_DATE}",
+                    "",
+                ]
+            )
+        )
+    print(f"最佳因子摘要已写入: {summary_path}")
 
     # 训练完成后可视化最佳因子
     best_expr = result.get("best_factor", "")

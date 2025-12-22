@@ -61,14 +61,18 @@ class FactorValidator:
             # 2. 解析为 AST 语法树
             tree = ast.parse(clean_expr, mode='eval')
             
-            # 3. 递归推断类型
+            # 3. 拒绝顶层就是 Sign(...) 的二值因子（信息量过低）
+            if isinstance(tree.body, ast.Call) and getattr(tree.body.func, "id", None) == "Sign":
+                return False
+
+            # 4. 递归推断类型
             result_type = self._infer_type(tree.body)
             
-            # 4. 检查是否有中间错误
+            # 5. 检查是否有中间错误
             if result_type == FactorType.ERROR:
                 return False
             
-            # 5. 强制根节点必须是 RATIO (无量纲)
+            # 6. 强制根节点必须是 RATIO (无量纲)
             # 这意味着公式的最终输出不能是 价格、成交量 或 时间
             if (result_type != FactorType.RATIO_MUL) and (result_type != FactorType.RATIO_PCT):
                 # 可选：打印日志方便调试
@@ -303,7 +307,16 @@ class FactorValidator:
                     return FactorType.ERROR
                 return FactorType.RATIO_PCT
             
+            
             if func_name == 'Log':
+                arg_node = args[0] if args else None
+                # 拦截嵌套 Log，避免 Log(Log(x)) 这类极易产生 -inf 的表达式
+                if isinstance(arg_node, ast.Call) and getattr(arg_node.func, "id", "") == "Log":
+                    return FactorType.ERROR
+                # 常数非正值不允许取 Log
+                if isinstance(arg_node, ast.Constant):
+                    if not isinstance(arg_node.value, (int, float)) or arg_node.value <= 0:
+                        return FactorType.ERROR
                 t = arg_types[0]
                 if t == FactorType.RATIO_MUL: return FactorType.RATIO_MUL
                 if t == FactorType.PRICE_ABS: return FactorType.RATIO_MUL # Log(Price) 视为无量纲数值
