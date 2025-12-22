@@ -15,7 +15,7 @@ from dqn_model import DQN, RNN_DQN
 class DeepQLearningAgent:
     def __init__(self, env, hidden_dim=128, lr=1e-3, gamma=0.99, epsilon=1.0):
         self.env = env
-        self.builder = FactorBuilder(max_depth=3, features=env.raw_features)
+        self.builder = FactorBuilder(max_depth=5, features=env.raw_features)
         
         self.action_dim = len(self.builder.action_map)
         
@@ -97,6 +97,7 @@ class DeepQLearningAgent:
         best_icir = -float('inf')
         valid_count = 0
         total_attempts = 0
+        best_mono = 0
         
         seen_factors = set()
         pending_futures = {}  # future -> (state, action, next_state, done, expr)
@@ -120,23 +121,30 @@ class DeepQLearningAgent:
                     state, action, next_state, done, expr = pending_futures.pop(future)
                     
                     try:
-                        ir, ic, icir, price_corr = future.result()
+                        ir, ic, icir, price_corr, monotonicity = future.result()
                         
                         is_correlated = abs(price_corr) > 0.6
 
-                        if ir > best_ir and not is_correlated:
+                        # === [新增] 单调性检查 ===
+                        is_monotonic = monotonicity > 0.6
+
+                        if ir > best_ir and not is_correlated and is_monotonic:
                             best_ir = ir
                             best_ic = ic
                             best_icir = icir
                             best_factor = expr
-                            print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | ICIR: {icir:.4f} | Corr: {price_corr:.4f} | {expr}")
+                            best_mono = monotonicity
+                            print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | ICIR: {icir:.4f} | Corr: {price_corr:.4f} | Mono:{monotonicity:.2f} | {expr}")
 
                         if is_correlated:
                             reward = -5.0
+                        elif not is_monotonic:
+                            reward = -2.0 # IR 高但分层乱 -> 给予惩罚
+                            # print(f"Rejected (Bad Layer): {expr} | IR:{ir:.2f} | Mono:{monotonicity:.2f}"
                         elif ir > 0:
-                            print(f"Valid & New: {expr} | IC: {ic:.4f} | ICIR: {icir:.4f}")
+                            print(f"Valid & New: {expr} | IC: {ic:.4f} | ICIR: {icir:.4f} | Mono:{monotonicity:.2f}")
                             valid_count += 1
-                            reward = ir * 20
+                            reward = ir * 20 + monotonicity * 10
                         else:
                             reward = -1.0
                             
@@ -210,6 +218,7 @@ class DeepQLearningAgent:
         print(f"Best IR: {best_ir:.4f}")
         print(f"Best IC: {best_ic:.4f}")
         print(f"Best ICIR: {best_icir:.4f}")
+        print(f"Monotonicity of best factor: {best_mono:.4f}")
 
         return {
             "best_factor": best_factor,

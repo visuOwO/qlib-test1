@@ -313,13 +313,14 @@ class FactorValidator:
                 # 拦截嵌套 Log，避免 Log(Log(x)) 这类极易产生 -inf 的表达式
                 if isinstance(arg_node, ast.Call) and getattr(arg_node.func, "id", "") == "Log":
                     return FactorType.ERROR
-                # 常数非正值不允许取 Log
-                if isinstance(arg_node, ast.Constant):
-                    if not isinstance(arg_node.value, (int, float)) or arg_node.value <= 0:
-                        return FactorType.ERROR
+                # 常数或表达式若无法保证恒正，则不允许取 Log
+                if not self._is_definitely_positive(arg_node):
+                    return FactorType.ERROR
                 t = arg_types[0]
                 if t == FactorType.RATIO_MUL: return FactorType.RATIO_MUL
                 if t == FactorType.PRICE_ABS: return FactorType.RATIO_MUL # Log(Price) 视为无量纲数值
+                if t == FactorType.VOLUME_ABS: return FactorType.RATIO_MUL
+                if t == FactorType.RATIO_PCT: return FactorType.RATIO_MUL
                 return FactorType.ERROR
 
             return FactorType.UNKNOWN
@@ -334,6 +335,42 @@ class FactorValidator:
             origin_name = node.id.replace('V_', '$')
             return self.ratio_semantics.get(origin_name)
         return None
+
+    def _is_definitely_positive(self, node) -> bool:
+        """
+        粗略判定表达式是否恒正（>0），用于保护 Log 的输入。
+        保守策略：不确定即判为 False。
+        """
+        # 原子：特征
+        if isinstance(node, ast.Name):
+            origin = node.id.replace('V_', '$')
+            t = self.atom_types.get(origin, FactorType.UNKNOWN)
+            return t in [FactorType.PRICE_ABS, FactorType.VOLUME_ABS, FactorType.RATIO_PCT, FactorType.RATIO_MUL]
+
+        # 原子：常数
+        if isinstance(node, ast.Constant):
+            try:
+                return float(node.value) > 0
+            except Exception:
+                return False
+
+        # 调用表达式
+        if isinstance(node, ast.Call):
+            func = getattr(node.func, "id", None)
+            args = node.args
+
+            if func in ['Ref', 'Mean', 'EMA', 'WMA', 'Sum']:
+                return len(args) >= 1 and self._is_definitely_positive(args[0])
+            if func in ['Max', 'Min']:
+                return len(args) >= 2 and self._is_definitely_positive(args[0]) and self._is_definitely_positive(args[1])
+            if func in ['Mul', 'Div']:
+                return len(args) >= 2 and self._is_definitely_positive(args[0]) and self._is_definitely_positive(args[1])
+            if func == 'Add':
+                return len(args) >= 2 and self._is_definitely_positive(args[0]) and self._is_definitely_positive(args[1])
+            # Abs / Rank / Gt / Lt / Sign / Delta / Slope / Std 等均不保证恒正
+            return False
+
+        return False
 
 # 简单测试
 if __name__ == "__main__":

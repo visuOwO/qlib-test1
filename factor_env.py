@@ -23,7 +23,7 @@ def init_worker(provider_uri, start_date, end_date, benchmark_code):
             bench_df = bench_df.droplevel(0)
             
         # 2. 预加载目标收益 (Target)
-        target_df = D.features(D.instruments("all"), ["Ref($close, -1)/$close - 1"], start_time=start_date, end_time=end_date, freq="day")
+        target_df = D.features(D.instruments("all"), ["Ref($close, -1)/Ref($open, -1) - 1"], start_time=start_date, end_time=end_date, freq="day")
         target_df.columns = ['target']
         
         # 3. 预加载基础行情 (可选，用于计算相关性，防止每次都去读 $close)
@@ -164,16 +164,25 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         
         if isinstance(daily_group_returns, pd.Series):
             if isinstance(daily_group_returns.index, pd.MultiIndex):
-                # 情况 1: 结果是 MultiIndex Series (datetime, group) -> Unstack 展开为 DataFrame
                 daily_group_returns = daily_group_returns.unstack()
             else:
-                # 情况 2: 结果是单日数据，Index 只是 group (0, 1, 2...) -> 转为单行 DataFrame
-                # 这种情况下 Series 的 name 可能是 datetime，转置后变为 index
                 daily_group_returns = daily_group_returns.to_frame().T
         
-        # 此时 daily_group_returns 必定是 DataFrame，可以安全访问 .columns
-        if 4 not in daily_group_returns.columns: 
-            return -1.0, ic_mean, icir, price_corr
+        # 统一补全 5 档列，缺失填 NaN
+        daily_group_returns = daily_group_returns.reindex(columns=range(5))
+        if 4 not in daily_group_returns.columns:
+            return -1.0, ic_mean, icir, price_corr, 0.0
+
+        # === 计算日度 Spearman 单调性并取均值 ===
+        def daily_monotone(row):
+            # 如果当日某组缺失，则放弃该日
+            if row.isna().any():
+                return np.nan
+            return row.corr(pd.Series(range(5)), method="spearman")
+
+        mono_series = daily_group_returns.apply(daily_monotone, axis=1)
+        monotonicity = mono_series.dropna().mean() if not mono_series.empty else 0.0
+        if np.isnan(monotonicity): monotonicity = 0.0
 
         long_ret = daily_group_returns[4]
         
@@ -192,7 +201,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
             ir = (mean_excess / std_excess) * np.sqrt(252)
             if np.isnan(ir): ir = -1.0
         
-        return ir, ic_mean, icir, price_corr
+        return ir, ic_mean, icir, price_corr, monotonicity
 
     except Exception:
         # 建议打印错误堆栈，否则调试困难
