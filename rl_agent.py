@@ -126,7 +126,7 @@ class DeepQLearningAgent:
                         is_correlated = abs(price_corr) > 0.6
 
                         # === [新增] 单调性检查 ===
-                        is_monotonic = monotonicity > 0.6
+                        is_monotonic = monotonicity > 0.1
 
                         if ir > best_ir and not is_correlated and is_monotonic:
                             best_ir = ir
@@ -138,13 +138,18 @@ class DeepQLearningAgent:
 
                         if is_correlated:
                             reward = -5.0
-                        elif not is_monotonic:
-                            reward = -2.0 # IR 高但分层乱 -> 给予惩罚
-                            # print(f"Rejected (Bad Layer): {expr} | IR:{ir:.2f} | Mono:{monotonicity:.2f}"
-                        elif ir > 0:
+                        elif ir > 0.2:
+                            base_reward = ir * 20
+    
+                            # 单调性作为加分项：
+                            # 如果单调性好，奖励大幅增加；如果不好，不扣分或少扣分
+                            # max(0, monotonicity) 确保单调性为负时不至于扣太多分，或者允许负向单调
+
+                            mono_bonus = max(0, monotonicity) * 10 
+                            
+                            reward = base_reward + mono_bonus
                             print(f"Valid & New: {expr} | IC: {ic:.4f} | ICIR: {icir:.4f} | Mono:{monotonicity:.2f}")
                             valid_count += 1
-                            reward = ir * 20 + monotonicity * 10
                         else:
                             reward = -1.0
                             

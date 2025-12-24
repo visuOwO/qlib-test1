@@ -18,12 +18,12 @@ def init_worker(provider_uri, start_date, end_date, benchmark_code):
             qlib.init(provider_uri=provider_uri, region=qlib.constant.REG_CN)
         
         # 1. 预加载基准收益
-        bench_df = D.features([benchmark_code], ["Ref($close, -1)/$close - 1"], start_date, end_date)
+        bench_df = D.features([benchmark_code], ["Ref($close, -5) / Ref($close, -1) - 1"], start_date, end_date)
         if not bench_df.empty and isinstance(bench_df.index, pd.MultiIndex):
             bench_df = bench_df.droplevel(0)
             
         # 2. 预加载目标收益 (Target)
-        target_df = D.features(D.instruments("all"), ["Ref($close, -1)/Ref($open, -1) - 1"], start_time=start_date, end_time=end_date, freq="day")
+        target_df = D.features(D.instruments("all"), ["Ref($close, -5) / Ref($close, -1) - 1"], start_time=start_date, end_time=end_date, freq="day")
         target_df.columns = ['target']
         
         # 3. 预加载基础行情 (可选，用于计算相关性，防止每次都去读 $close)
