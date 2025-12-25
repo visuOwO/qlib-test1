@@ -3,12 +3,77 @@ import argparse
 import pandas as pd
 import numpy as np
 import traceback
+from pathlib import Path
+from typing import Optional, Union
 from qlib.data import D
 from qlib.config import C
 
 _WORKER_CACHE = {}
+DEFAULT_CSI500_MEMBERSHIP = Path("./qlib_meta/csi500_membership.csv")
 
-def init_worker(provider_uri, start_date, end_date, benchmark_code):
+def _ts_code_to_qlib_instrument(ts_code: str) -> str:
+    parts = ts_code.split(".")
+    if len(parts) != 2:
+        return ts_code.upper()
+    return f"{parts[1]}{parts[0]}".upper()
+
+def _load_csi500_membership(membership_path: Optional[Union[str, Path]]):
+    if not membership_path:
+        return None
+    path = Path(membership_path)
+    if not path.exists():
+        print(f"[WARN] CSI500 membership file not found: {path}")
+        return None
+
+    df = pd.read_csv(path)
+    if df.empty:
+        print(f"[WARN] CSI500 membership file is empty: {path}")
+        return None
+
+    if "instrument" not in df.columns:
+        if "con_code" in df.columns:
+            df["instrument"] = df["con_code"].apply(_ts_code_to_qlib_instrument)
+        else:
+            print(f"[WARN] CSI500 membership missing instrument/con_code: {path}")
+            return None
+
+    if "date" in df.columns:
+        df["datetime"] = pd.to_datetime(df["date"])
+    elif "trade_date" in df.columns:
+        df["datetime"] = pd.to_datetime(df["trade_date"])
+    else:
+        print(f"[WARN] CSI500 membership missing date column: {path}")
+        return None
+
+    df["instrument"] = df["instrument"].astype(str).str.upper()
+    return pd.MultiIndex.from_frame(df[["instrument", "datetime"]])
+
+def _align_membership_index(index: pd.MultiIndex, membership_index: pd.MultiIndex) -> pd.Series:
+    if membership_index is None or index.empty:
+        return pd.Series(False, index=index)
+
+    mem_df = membership_index.to_frame(index=False).rename(columns={"datetime": "mem_date"})
+    mem_dates = mem_df[["mem_date"]].drop_duplicates().sort_values("mem_date")
+    dates = pd.DataFrame(
+        {"datetime": pd.to_datetime(index.get_level_values("datetime").unique())}
+    ).sort_values("datetime")
+    mapped = pd.merge_asof(
+        dates,
+        mem_dates,
+        left_on="datetime",
+        right_on="mem_date",
+        direction="backward",
+    )
+    date_to_mem = mapped.set_index("datetime")["mem_date"]
+    mem_date_for_row = index.get_level_values("datetime").map(date_to_mem)
+    membership_set = set(zip(mem_df["instrument"], mem_df["mem_date"]))
+    mask = [
+        (inst, mem_date) in membership_set if pd.notna(mem_date) else False
+        for inst, mem_date in zip(index.get_level_values("instrument"), mem_date_for_row)
+    ]
+    return pd.Series(mask, index=index)
+
+def init_worker(provider_uri, start_date, end_date, benchmark_code, csi500_membership_path=None):
     """
     子进程初始化函数：只运行一次
     负责初始化 Qlib 并加载公共数据到全局变量
@@ -30,6 +95,9 @@ def init_worker(provider_uri, start_date, end_date, benchmark_code):
         # 这里我们至少可以把 target 和 benchmark 存起来
         _WORKER_CACHE['benchmark_ret'] = bench_df
         _WORKER_CACHE['target_df'] = target_df
+
+        csi500_index = _load_csi500_membership(csi500_membership_path or DEFAULT_CSI500_MEMBERSHIP)
+        _WORKER_CACHE["csi500_index"] = csi500_index
         
         print(f"[Worker] Initialized with Target Data shape: {target_df.shape}")
         
@@ -46,9 +114,10 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         # 从全局缓存获取数据
         target_df = _WORKER_CACHE.get('target_df')
         benchmark_ret_df = _WORKER_CACHE.get('benchmark_ret')
+        csi500_index = _WORKER_CACHE.get("csi500_index")
         
         if target_df is None or target_df.empty:
-            return -1.0, -1.0, -1.0, -1.0
+            return -1.0, -1.0, -1.0, -1.0, -1.0
 
         # 4. Get factor data (因子数据必须动态计算)
         try:
@@ -63,9 +132,9 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
             )
         except Exception as e:
             # 公式错误等情况
-            return -1.0, -1.0, -1.0, -1.0
+            return -1.0, -1.0, -1.0, -1.0, -1.0
 
-        if factor_df.empty: return -1.0, -1.0, -1.0, -1.0
+        if factor_df.empty: return -1.0, -1.0, -1.0, -1.0, -1.0
         
         if 'SH000300' in factor_df.index.get_level_values('instrument'):
             factor_df = factor_df.drop('SH000300', level='instrument')
@@ -74,16 +143,9 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         merged_df = pd.merge(factor_df, target_df, left_index=True, right_index=True, how='inner')
         merged_df.dropna(inplace=True)
         
-        if merged_df.empty: return -1.0, -1.0, -1.0, -1.0
+        if merged_df.empty: return -1.0, -1.0, -1.0, -1.0, -1.0
 
-        # 6. Price Correlation Check
-        price_corr_series = merged_df.groupby(level='datetime').apply(
-            lambda x: x[factor_expression].corr(x['$close'], method='spearman')
-        )
-        price_corr = price_corr_series.mean()
-        if np.isnan(price_corr): price_corr = 1.0
-
-        # 7. Circulating Market Value Neutralization
+        # 6. Circulating Market Value Neutralization (use full market)
         merged_df['log_mkt_cap'] = np.log(merged_df['$circ_mv'] + 1)
 
         def clip_outliers(series):
@@ -137,8 +199,23 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         merged_df['neu_factor'] = merged_df.groupby(['datetime', '$industry'])['size_neu_factor'].transform(industry_neutralize_and_standardize)
         merged_df['neu_factor'] = merged_df['neu_factor'].fillna(0)
 
+        # 7. Filter to CSI500 for factor analysis
+        analysis_df = merged_df
+        if csi500_index is not None:
+            in_membership = _align_membership_index(merged_df.index, csi500_index)
+            analysis_df = merged_df.loc[in_membership.values]
+        if analysis_df.empty:
+            return -1.0, -1.0, -1.0, -1.0, -1.0
+
+        # 8. Price Correlation Check
+        price_corr_series = analysis_df.groupby(level='datetime').apply(
+            lambda x: x[factor_expression].corr(x['$close'], method='spearman')
+        )
+        price_corr = price_corr_series.mean()
+        if np.isnan(price_corr): price_corr = 1.0
+
         # 9. Calculate Metrics
-        ic_series = merged_df.groupby(level='datetime').apply(
+        ic_series = analysis_df.groupby(level='datetime').apply(
             lambda x: x['neu_factor'].corr(x['target'], method='spearman')
         )
         ic_mean = ic_series.mean()
@@ -160,7 +237,7 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
             except ValueError:
                 return pd.Series()
         
-        daily_group_returns = merged_df.groupby(level='datetime').apply(get_group_return)
+        daily_group_returns = analysis_df.groupby(level='datetime').apply(get_group_return)
         
         if isinstance(daily_group_returns, pd.Series):
             if isinstance(daily_group_returns.index, pd.MultiIndex):
@@ -206,15 +283,16 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
     except Exception:
         # 建议打印错误堆栈，否则调试困难
         traceback.print_exc() 
-        return -1.0, -1.0, -1.0, -1.0
+        return -1.0, -1.0, -1.0, -1.0, -1.0
 
 
 class FactorMiningEnv:
-    def __init__(self, start_date, end_date, benchmark_code="sh000300", provider_uri="./qlib_bin_data"):
+    def __init__(self, start_date, end_date, benchmark_code="sh000300", provider_uri="./qlib_bin_data", csi500_membership_path=DEFAULT_CSI500_MEMBERSHIP):
         self.start_date = start_date
         self.end_date = end_date
         self.benchmark_code = benchmark_code
         self.provider_uri = provider_uri
+        self.csi500_membership_path = csi500_membership_path
         
         # Initialize Qlib in the main process
         if not C.get("initialized", False):
@@ -236,7 +314,13 @@ class FactorMiningEnv:
         It can be used for single-threaded evaluation or testing.
         """
         if not _WORKER_CACHE:
-            init_worker(self.provider_uri, self.start_date, self.end_date, self.benchmark_code)
+            init_worker(
+                self.provider_uri,
+                self.start_date,
+                self.end_date,
+                self.benchmark_code,
+                self.csi500_membership_path,
+            )
         return evaluate_factor_mp(
             factor_expression,
             self.start_date,
@@ -251,11 +335,12 @@ def main():
     parser.add_argument("--end", default="2024-01-01", help="End date (YYYY-MM-DD)")
     parser.add_argument("--benchmark", default="sh000300", help="Benchmark instrument code")
     parser.add_argument("--provider", default="./qlib_bin_data", help="Qlib provider uri")
+    parser.add_argument("--csi500_membership", default=str(DEFAULT_CSI500_MEMBERSHIP), help="CSI500 membership csv path")
     args = parser.parse_args()
 
-    init_worker(args.provider, args.start, args.end, args.benchmark)
+    init_worker(args.provider, args.start, args.end, args.benchmark, args.csi500_membership)
 
-    ir, ic, icir, price_corr = evaluate_factor_mp(args.expression, args.start, args.end)
+    ir, ic, icir, price_corr, _ = evaluate_factor_mp(args.expression, args.start, args.end)
     print(f"Expression: {args.expression}")
     print(f"IR: {ir:.4f}")
     print(f"IC: {ic:.4f}")

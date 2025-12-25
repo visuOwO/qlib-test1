@@ -17,6 +17,7 @@ END_DATE = "20251031"
 # 3. 输出目录设置
 CSV_OUTPUT_DIR = Path("./qlib_source_csv") # 存放转换好的CSV
 QLIB_DATA_DIR = Path("./qlib_bin_data")    # 存放最终的bin文件
+META_OUTPUT_DIR = Path("./qlib_meta")      # 存放元数据（如成分股列表）
 
 # ===========================================
 
@@ -28,14 +29,54 @@ def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
+def ts_code_to_qlib_instrument(ts_code: str) -> str:
+    parts = ts_code.split(".")
+    if len(parts) != 2:
+        return ts_code.upper()
+    return f"{parts[1]}{parts[0]}".upper()
+
 def get_stock_list(pro):
-    """获取中证500成分股作为Demo (避免下载全市场耗时过长)"""
-    # 如果您想下载全市场，可以使用 pro.stock_basic(exchange='', list_status='L')
-    print("正在获取股票列表 (以中证500为例)...")
-    df = pro.index_weight(index_code='000905.SH', start_date="20241201", end_date="20241231")
-    stock_list = df['con_code'].unique().tolist()
+    """获取全市场股票列表"""
+    print("正在获取股票列表 (全市场)...")
+    df = pro.stock_basic(exchange="", list_status="L", fields="ts_code")
+    stock_list = df["ts_code"].unique().tolist()
     print(f"获取到 {len(stock_list)} 只股票。")
     return stock_list
+
+def _iter_month_ranges(start_date: str, end_date: str):
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    current = start_dt.replace(day=1)
+    while current <= end_dt:
+        month_end = current + pd.offsets.MonthEnd(0)
+        seg_start = max(start_dt, current)
+        seg_end = min(end_dt, month_end)
+        yield seg_start.strftime("%Y%m%d"), seg_end.strftime("%Y%m%d")
+        current = current + pd.offsets.MonthBegin(1)
+
+def get_csi500_membership(pro, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    动态获取中证500成分股，按日保存成员列表。
+    """
+    print("正在获取中证500成分股 (按月分段)...")
+    frames = []
+    for seg_start, seg_end in _iter_month_ranges(start_date, end_date):
+        try:
+            df = pro.index_weight(index_code="000905.SH", start_date=seg_start, end_date=seg_end)
+        except Exception as e:
+            print(f"获取中证500成分失败: {seg_start} ~ {seg_end}, {e}")
+            df = None
+        if df is not None and not df.empty:
+            frames.append(df[["trade_date", "con_code"]])
+        time.sleep(0.3)
+
+    if not frames:
+        return pd.DataFrame()
+
+    data = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["trade_date", "con_code"])
+    data["date"] = pd.to_datetime(data["trade_date"]).dt.strftime("%Y-%m-%d")
+    data["instrument"] = data["con_code"].apply(ts_code_to_qlib_instrument)
+    return data[["date", "instrument", "con_code"]]
 
 # 预先加载行业映射
 def get_industry_map(pro):
@@ -170,10 +211,19 @@ def process_index_data(pro, ts_code, start_date, end_date):
 def main():
     pro = init_tushare()
     ensure_dir(CSV_OUTPUT_DIR)
+    ensure_dir(META_OUTPUT_DIR)
 
     # 1. 获取行业映射
     industry_map = get_industry_map(pro)
+
+    # 2. 获取中证500成分股（动态），供后续因子分析使用
+    csi500_df = get_csi500_membership(pro, START_DATE, END_DATE)
+    if not csi500_df.empty:
+        membership_path = META_OUTPUT_DIR / "csi500_membership.csv"
+        csi500_df.to_csv(membership_path, index=False)
+        print(f"中证500成分股已保存: {membership_path}")
     
+    # 3. 获取全市场股票列表
     stock_list = get_stock_list(pro)
     
     # 限制 Demo 数量，防止 Tushare 触发流控 (如果您的积分够高，可以去掉 [:50])

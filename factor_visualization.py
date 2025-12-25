@@ -7,6 +7,10 @@ from matplotlib import font_manager, rcParams
 import qlib
 from qlib.data import D
 from qlib.config import C
+from pathlib import Path
+from typing import Optional, Union
+
+DEFAULT_CSI500_MEMBERSHIP = Path("./qlib_meta/csi500_membership.csv")
 
 
 def init_qlib(provider_uri: str):
@@ -45,6 +49,68 @@ def prepare_factor_data(expr: str, start: str, end: str, benchmark: str) -> pd.D
 
     factor_df = factor_df.dropna()
     return factor_df
+
+def _ts_code_to_qlib_instrument(ts_code: str) -> str:
+    parts = ts_code.split(".")
+    if len(parts) != 2:
+        return ts_code.upper()
+    return f"{parts[1]}{parts[0]}".upper()
+
+def load_csi500_membership(membership_path: Optional[Union[str, Path]]) -> Optional[pd.MultiIndex]:
+    if not membership_path:
+        return None
+    path = Path(membership_path)
+    if not path.exists():
+        print(f"[WARN] CSI500 membership file not found: {path}")
+        return None
+
+    df = pd.read_csv(path)
+    if df.empty:
+        print(f"[WARN] CSI500 membership file is empty: {path}")
+        return None
+
+    if "instrument" not in df.columns:
+        if "con_code" in df.columns:
+            df["instrument"] = df["con_code"].apply(_ts_code_to_qlib_instrument)
+        else:
+            print(f"[WARN] CSI500 membership missing instrument/con_code: {path}")
+            return None
+
+    if "date" in df.columns:
+        df["datetime"] = pd.to_datetime(df["date"])
+    elif "trade_date" in df.columns:
+        df["datetime"] = pd.to_datetime(df["trade_date"])
+    else:
+        print(f"[WARN] CSI500 membership missing date column: {path}")
+        return None
+
+    df["instrument"] = df["instrument"].astype(str).str.upper()
+    return pd.MultiIndex.from_frame(df[["instrument", "datetime"]])
+
+def align_membership_index(index: pd.MultiIndex, membership_index: pd.MultiIndex) -> pd.Series:
+    if membership_index is None or index.empty:
+        return pd.Series(False, index=index)
+
+    mem_df = membership_index.to_frame(index=False).rename(columns={"datetime": "mem_date"})
+    mem_dates = mem_df[["mem_date"]].drop_duplicates().sort_values("mem_date")
+    dates = pd.DataFrame(
+        {"datetime": pd.to_datetime(index.get_level_values("datetime").unique())}
+    ).sort_values("datetime")
+    mapped = pd.merge_asof(
+        dates,
+        mem_dates,
+        left_on="datetime",
+        right_on="mem_date",
+        direction="backward",
+    )
+    date_to_mem = mapped.set_index("datetime")["mem_date"]
+    mem_date_for_row = index.get_level_values("datetime").map(date_to_mem)
+    membership_set = set(zip(mem_df["instrument"], mem_df["mem_date"]))
+    mask = [
+        (inst, mem_date) in membership_set if pd.notna(mem_date) else False
+        for inst, mem_date in zip(index.get_level_values("instrument"), mem_date_for_row)
+    ]
+    return pd.Series(mask, index=index)
 
 
 def neutralize_factor(df: pd.DataFrame) -> pd.DataFrame:
@@ -125,11 +191,15 @@ def calc_turnover(df: pd.DataFrame, focus_group: int) -> pd.Series:
     return pd.Series(turnover_list, index=pd.to_datetime(dates)).sort_index()
 
 
-def visualize_factor(expr: str, start: str, end: str, provider: str, benchmark: str = "sh000300", groups: int = 5, focus_group: int = 4):
+def visualize_factor(expr: str, start: str, end: str, provider: str, benchmark: str = "sh000300", groups: int = 5, focus_group: int = 4, csi500_membership: Optional[Union[str, Path]] = DEFAULT_CSI500_MEMBERSHIP):
     _set_chinese_font()
     init_qlib(provider)
     df = prepare_factor_data(expr, start, end, benchmark)
     df = neutralize_factor(df)
+    csi500_index = load_csi500_membership(csi500_membership)
+    if csi500_index is not None:
+        in_membership = align_membership_index(df.index, csi500_index)
+        df = df.loc[in_membership.values]
     df, group_ret = calc_group_returns(df, groups)
 
     if focus_group not in group_ret.columns:
@@ -196,6 +266,7 @@ def main():
     parser.add_argument("--benchmark", default="sh000300", help="基准代码，例如 sh000300")
     parser.add_argument("--groups", type=int, default=5, help="分层数量")
     parser.add_argument("--focus_group", type=int, default=4, help="关注的分组编号（0-index）")
+    parser.add_argument("--csi500_membership", default=str(DEFAULT_CSI500_MEMBERSHIP), help="CSI500 成分股路径")
     args = parser.parse_args()
 
     visualize_factor(
@@ -206,6 +277,7 @@ def main():
         benchmark=args.benchmark,
         groups=args.groups,
         focus_group=args.focus_group,
+        csi500_membership=args.csi500_membership,
     )
 
 

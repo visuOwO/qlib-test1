@@ -105,7 +105,13 @@ class DeepQLearningAgent:
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=num_workers,
             initializer=init_worker,  # 指定初始化函数
-            initargs=(self.env.provider_uri, self.env.start_date, self.env.end_date, self.env.benchmark_code) # 传递参数
+            initargs=(
+                self.env.provider_uri,
+                self.env.start_date,
+                self.env.end_date,
+                self.env.benchmark_code,
+                self.env.csi500_membership_path,
+            ) # 传递参数
         ) as executor:
             
             while valid_count < target_valid_episodes and total_attempts < max_attempts:
