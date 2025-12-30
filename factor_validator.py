@@ -17,7 +17,11 @@ class FactorType(Enum):
     ERROR = -1
 
 class FactorValidator:
-    def __init__(self):
+    def __init__(self, max_feature_repeat=None):
+        # 定义同一特征的最大出现次数，None 表示不限制
+        self.max_feature_repeat = max_feature_repeat
+        self.feature_counts = {}  # 特征出现次数计数
+
         # 定义原子特征的类型
         self.atom_types = {
             '$open': FactorType.PRICE_ABS,
@@ -54,33 +58,36 @@ class FactorValidator:
         返回: True (合法) / False (非法)
         """
         try:
-            # 1. 预处理：Qlib 的 $ 符号在 Python ast 中是非法的，替换为合法字符
+            # 1. 重置特征计数器
+            self.feature_counts = {}
+
+            # 2. 预处理：Qlib 的 $ 符号在 Python ast 中是非法的，替换为合法字符
             # 例如: $close -> V_close
             clean_expr = expression.replace('$', 'V_')
-            
-            # 2. 解析为 AST 语法树
+
+            # 3. 解析为 AST 语法树
             tree = ast.parse(clean_expr, mode='eval')
-            
-            # 3. 拒绝顶层就是 Sign(...) 的二值因子（信息量过低）
+
+            # 4. 拒绝顶层就是 Sign(...) 的二值因子（信息量过低）
             if isinstance(tree.body, ast.Call) and getattr(tree.body.func, "id", None) == "Sign":
                 return False
 
-            # 4. 递归推断类型
+            # 5. 递归推断类型
             result_type = self._infer_type(tree.body)
-            
-            # 5. 检查是否有中间错误
+
+            # 6. 检查是否有中间错误
             if result_type == FactorType.ERROR:
                 return False
-            
-            # 6. 强制根节点必须是 RATIO (无量纲)
+
+            # 7. 强制根节点必须是 RATIO (无量纲)
             # 这意味着公式的最终输出不能是 价格、成交量 或 时间
             if (result_type != FactorType.RATIO_MUL) and (result_type != FactorType.RATIO_PCT):
                 # 可选：打印日志方便调试
                 # print(f"Rejected: Type is {result_type}, expected RATIO. Expr: {expression}")
                 return False
-            
+
             return True
-            
+
         except Exception as e:
             # print(f"Validation Parse Error for expression: {e}")
             return False
@@ -89,6 +96,13 @@ class FactorValidator:
         # === 1. 基础节点 ===
         if isinstance(node, ast.Name):
             origin_name = node.id.replace('V_', '$')
+
+            # 检查特征出现次数
+            if self.max_feature_repeat is not None:
+                self.feature_counts[origin_name] = self.feature_counts.get(origin_name, 0) + 1
+                if self.feature_counts[origin_name] > self.max_feature_repeat:
+                    return FactorType.ERROR
+
             return self.atom_types.get(origin_name, FactorType.UNKNOWN) # 建议默认为 UNKNOWN 或在 init 里定义全
             
         if isinstance(node, ast.Constant):
@@ -129,7 +143,7 @@ class FactorValidator:
             
             # 组 A: 聚合类函数 (Window=1 是废话)
             # Mean(x, 1) == x, Max(x, 1) == x
-            if func_name in ['Mean', 'EMA', 'WMA', 'Max', 'Min', 'Sum']:
+            if func_name in ['Mean', 'EMA', 'WMA', 'Max', 'Min', 'Sum', 'Ts_Rank']:
                 if len(args) > 1 and isinstance(args[1], ast.Constant) and args[1].value == 1:
                     return FactorType.ERROR
 
@@ -257,12 +271,12 @@ class FactorValidator:
             # 规则 E: 时序函数与窗口检查 (分拆逻辑)
             
             # 1. 聚合类函数: Window=1 是废话 (等于自身)
-            if func_name in ['Mean', 'EMA', 'WMA', 'Max', 'Min', 'Sum', 'Rank']:
+            if func_name in ['Mean', 'EMA', 'WMA', 'Max', 'Min', 'Sum', 'Rank', 'Ts_Rank']:
                 window_node = args[1]
                 if isinstance(window_node, ast.Constant) and window_node.value == 1:
                     return FactorType.ERROR
                 # Rank($close, 10) -> RATIO (百分比)
-                if func_name == 'Rank':
+                if func_name in ['Rank', 'Ts_Rank']:
                     return FactorType.RATIO_PCT
                 return arg_types[0] # 保持输入类型
 
@@ -306,6 +320,16 @@ class FactorValidator:
                 if func_name == 'Sign' and arg_types[0] in [FactorType.PRICE_ABS, FactorType.VOLUME_ABS]:
                     return FactorType.ERROR
                 return FactorType.RATIO_PCT
+
+            if func_name == 'Abs':
+                arg_node = args[0] if args else None
+                # 拦截嵌套 Abs，避免 Abs(Abs(x)) 这类冗余表达式
+                if isinstance(arg_node, ast.Call) and getattr(arg_node.func, "id", "") == "Abs":
+                    return FactorType.ERROR
+                t = arg_types[0]
+                if t in [FactorType.UNKNOWN, FactorType.ERROR]:
+                    return FactorType.ERROR
+                return t
             
             
             if func_name == 'Log':
@@ -385,7 +409,7 @@ if __name__ == "__main__":
     # 案例 2: 正确 (价/价)
     expr2 = "Div($close, Ref($close, 1))"
     print(f"Check {expr2}: {v.validate(expr2)}") # 应为 True
-    
+
     # 案例 3: 正确 (价+价)
     expr3 = "Rank($pe, 2)"
     print(f"Check {expr3}: {v.validate(expr3)}") # 应为 True
@@ -395,3 +419,45 @@ if __name__ == "__main__":
 
     expr5 = "Ref(Log(Sub($turnover_rate, $close)), 5)"
     print(f"Check {expr5}: {v.validate(expr5)}") # 应为 False，跨语义比率相减应被拦截
+
+    # 案例 6: 嵌套 Abs 测试 (重复计算，应为非法)
+    expr6 = "Abs(Abs($close))"
+    print(f"Check {expr6}: {v.validate(expr6)}") # 应为 False
+
+    # 案例 7: 正常 Abs 测试 (应为合法)
+    expr7 = "Abs(Sub($pb, $pe_ttm))"
+    print(f"Check {expr7}: {v.validate(expr7)}") # 应为 True
+
+    # 案例 8: 三重嵌套 Abs 测试 (应为非法)
+    expr8 = "Abs(Abs(Abs($close)))"
+    print(f"Check {expr8}: {v.validate(expr8)}") # 应为 False
+
+    # 案例 9: 嵌套 Log 测试 (应为非法)
+    expr9 = "Log(Log($close))"
+    print(f"Check {expr9}: {v.validate(expr9)}") # 应为 False
+
+    # === 特征重复次数测试 ===
+    print("\n=== 特征重复次数测试 (max_feature_repeat=2) ===")
+    v2 = FactorValidator(max_feature_repeat=2)
+
+    # 同一特征出现 2 次 (合法)
+    expr10 = "Add($dv_ttm, $dv_ttm)"
+    print(f"Check {expr10}: {v2.validate(expr10)}") # 应为 True
+
+    # 同一特征出现 3 次 (非法)
+    expr11 = "Add(Add($dv_ttm, $dv_ttm), $dv_ttm)"
+    print(f"Check {expr11}: {v2.validate(expr11)}") # 应为 False
+
+    # 不同特征各出现 1 次 (合法)
+    expr12 = "Mul($dv_ttm, Std(Mul($dv_ttm, $dv_ttm), 20))"
+    print(f"Check {expr12}: {v2.validate(expr12)}") # 应为 True
+
+    # Ref($close, 1) + $close (出现 2 次，合法)
+    expr13 = "Add($dv_ttm, Ref($dv_ttm, 1))"
+    print(f"Check {expr13}: {v2.validate(expr13)}") # 应为 True
+
+    print("\n=== 无限制测试 (max_feature_repeat=None) ===")
+    v3 = FactorValidator()  # 默认不限制
+
+    expr14 = "Add(Add(Add($dv_ttm, $dv_ttm), $dv_ttm), $dv_ttm)"
+    print(f"Check {expr14}: {v3.validate(expr14)}") # 应为 True

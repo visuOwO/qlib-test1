@@ -2,15 +2,14 @@ import numpy as np
 
 class FactorBuilder:
     """
-    Manages the construction of a factor expression tree.
-    State: [CurrentDepth, SlotType(OneHot), LastActionEmbedding...]
+    Builds factor expressions using Reverse Polish Notation (RPN).
+    Each action selects a token (feature/int/operator), and RPN is
+    converted back into a Qlib expression for validation/evaluation.
     """
-    TYPE_OP = 0
-    TYPE_FEATURE = 1
-    TYPE_INT = 2
+    STACK_EXPR = "expr"
+    STACK_INT = "int"
 
-    def __init__(self, max_depth=3, features=None):
-        self.max_depth = max_depth
+    def __init__(self, max_seq_len=20, features=None):
         self.features = features or []
         
         # --- Expanded Operator Set ---
@@ -39,16 +38,16 @@ class FactorBuilder:
         self.action_map.extend([(op, 'UNARY_SIMPLE') for op in self.ops_unary_simple])
         self.action_map.extend([(f, 'FEATURE') for f in self.features])
         self.action_map.extend([(i, 'INT') for i in set(self.windows + self.offsets)])
+        self.action_map.append(("END", "END"))
 
-        self.max_seq_len = 20 # 定义一个最大序列长度，比如20
+        self.max_seq_len = max_seq_len # 定义一个最大序列长度
         self.action_history = [] # 用于记录历史动作
         
         self.reset()
 
     def reset(self):
-        # Stack contains: (required_type, current_depth)
-        self.stack = [(self.TYPE_OP, 0)] 
-        self.expression_parts = [] # To store the constructed tree structure
+        self.stack = []  # Stack of (type, depth) for RPN parsing
+        self.rpn_tokens = [] # RPN token sequence
         self.done = False
         self.action_history = [] # 重置历史
         return self.get_state()
@@ -72,31 +71,60 @@ class FactorBuilder:
         """
         Returns a mask of valid action indices.
         """
-        if not self.stack:
+        if self.done:
             return []
-
-        req_type, depth = self.stack[-1]
         valid_indices = []
+        remaining = self.max_seq_len - len(self.rpn_tokens) - 1
+        if remaining < 0:
+            return []
+        expr_count, int_count = self._count_stack()
+        stack_top = self.stack[-1][0] if self.stack else None
+
+        # 获取上一个算子（忽略 INT 和 FEATURE），用于检查重复连续调用
+        last_op = None
+        for token in reversed(self.rpn_tokens):
+            if isinstance(token, str) and token not in ["END"] and not token.startswith('$'):
+                last_op = token
+                break
 
         for idx, (val, kind) in enumerate(self.action_map):
-            if req_type == self.TYPE_OP:
-                # If we reached max depth, we CANNOT pick operators anymore, must pick features
-                if depth >= self.max_depth:
-                    if kind == 'FEATURE':
-                        valid_indices.append(idx)
-                else:
-                    # Can pick Operators OR Features
-                    if kind in ['BINARY', 'UNARY_WIN', 'UNARY_OFF', 'UNARY_SIMPLE', 'FEATURE']:
-                        valid_indices.append(idx)
-            
-            elif req_type == self.TYPE_FEATURE:
-                # Must pick feature
-                if kind == 'FEATURE':
+            if kind == "FEATURE":
+                if stack_top == self.STACK_INT:
+                    continue
+                if self._can_finish_after_action(expr_count + 1, int_count, remaining):
                     valid_indices.append(idx)
-            
-            elif req_type == self.TYPE_INT:
-                # Must pick int
-                if kind == 'INT':
+            elif kind == "INT":
+                # Int tokens are only useful after an expr exists (for Ref/Mean/etc.)
+                if stack_top == self.STACK_EXPR:
+                    if self._can_finish_after_action(expr_count, int_count + 1, remaining):
+                        valid_indices.append(idx)
+            elif kind == "UNARY_SIMPLE":
+                if stack_top == self.STACK_INT:
+                    continue
+                # 阻止连续调用相同的算子 (如 Abs, Abs)
+                if last_op == val:
+                    continue
+                if self._can_apply_unary():
+                    if self._can_finish_after_action(expr_count, int_count, remaining):
+                        valid_indices.append(idx)
+            elif kind == "UNARY_WIN" or kind == "UNARY_OFF":
+                # 阻止连续调用相同的算子 (如 Mean, Mean)
+                if last_op == val:
+                    continue
+                if self._can_apply_unary_with_int():
+                    if self._can_finish_after_action(expr_count, int_count - 1, remaining):
+                        valid_indices.append(idx)
+            elif kind == "BINARY":
+                if stack_top == self.STACK_INT:
+                    continue
+                # 阻止连续调用相同的算子 (如 Add, Add)
+                if last_op == val:
+                    continue
+                if self._can_apply_binary():
+                    if self._can_finish_after_action(expr_count - 1, int_count, remaining):
+                        valid_indices.append(idx)
+            elif kind == "END":
+                if self._can_end():
                     valid_indices.append(idx)
 
         return valid_indices
@@ -109,82 +137,127 @@ class FactorBuilder:
         self.action_history.append(action_idx)
 
         val, kind = self.action_map[action_idx]
-        req_type, depth = self.stack.pop()
         
-        # Store the choice
-        self.expression_parts.append(val)
+        # Store token
+        self.rpn_tokens.append(val)
 
-        # Push new requirements to stack based on action
-        if kind == 'BINARY':
-            # Needs 2 arguments. Push right then left (so left is popped first)
-            self.stack.append((self.TYPE_OP, depth + 1))
-            self.stack.append((self.TYPE_OP, depth + 1))
-        elif kind in ['UNARY_WIN', 'UNARY_OFF']:
-            # Needs 1 argument + 1 int
-            self.stack.append((self.TYPE_INT, depth))
-            self.stack.append((self.TYPE_OP, depth + 1))
-        elif kind == 'UNARY_SIMPLE':
-            # Needs 1 argument only
-            self.stack.append((self.TYPE_OP, depth + 1))
-        elif kind == 'FEATURE':
-            # Terminal
-            pass
-        elif kind == 'INT':
-            # Terminal
-            pass
+        # Apply RPN stack transition
+        if kind == "FEATURE":
+            self.stack.append((self.STACK_EXPR, 1))
+        elif kind == "INT":
+            self.stack.append((self.STACK_INT, 1))
+        elif kind == "UNARY_SIMPLE":
+            self._apply_unary()
+        elif kind == "UNARY_WIN" or kind == "UNARY_OFF":
+            self._apply_unary_with_int()
+        elif kind == "BINARY":
+            self._apply_binary()
+        elif kind == "END":
+            self.done = True
 
-        if not self.stack:
+        if len(self.rpn_tokens) >= self.max_seq_len:
             self.done = True
         
         return self.get_state(), self.done
 
     def build_expression(self):
         """
-        Reconstructs the string expression from the sequence of choices (Pre-order traversal).
-        [Modified] Applies Canonicalization (Normalization) for commutative operators (Add, Mul).
+        Converts RPN tokens into a Qlib expression.
         """
-        if not self.expression_parts: return ""
-        
-        iterator = iter(self.expression_parts)
-        
-        def _recurse():
-            try:
-                token = next(iterator)
-            except StopIteration:
-                return "Error"
+        if not self.rpn_tokens:
+            return ""
 
-            # Check type of token
-            if isinstance(token, str):
-                if token in self.ops_binary:
-                    # Binary Op: recursively build left and right children
-                    left = _recurse()
-                    right = _recurse()
-                    
-                    # 对于满足交换律的算子 (Add, Mul)，按字符串字典序重排参数
-                    # 这确保了 Add(A, B) 和 Add(B, A) 生成完全相同的字符串
-                    if token in ["Add", "Mul"]:
-                        if left > right: # 字符串比较：如果左边大于右边，则交换
-                            left, right = right, left
-
-                    return f"{token}({left}, {right})"
-                
-                elif token in self.ops_unary_win + self.ops_unary_off:
-                    arg = _recurse()
-                    param = _recurse() # The INT
-                    return f"{token}({arg}, {param})"
-                
-                elif token in self.ops_unary_simple:
-                    arg = _recurse()
-                    return f"{token}({arg})"
-                
-                else:
-                    # Feature
-                    return token
+        stack = []
+        for token in self.rpn_tokens:
+            if token == "END":
+                break
+            if isinstance(token, str) and token in self.ops_binary:
+                if len(stack) < 2:
+                    return "Error"
+                right = stack.pop()
+                left = stack.pop()
+                if token in ["Add", "Mul"] and left > right:
+                    left, right = right, left
+                stack.append(f"{token}({left}, {right})")
+            elif isinstance(token, str) and token in self.ops_unary_win + self.ops_unary_off:
+                if len(stack) < 2:
+                    return "Error"
+                param = stack.pop()
+                arg = stack.pop()
+                stack.append(f"{token}({arg}, {param})")
+            elif isinstance(token, str) and token in self.ops_unary_simple:
+                if len(stack) < 1:
+                    return "Error"
+                arg = stack.pop()
+                stack.append(f"{token}({arg})")
+            elif isinstance(token, str):
+                # Feature
+                stack.append(token)
             else:
                 # Int
-                return str(token)
+                stack.append(str(token))
 
-        try:
-            return _recurse()
-        except:
+        if len(stack) != 1:
             return "Error"
+        return stack[0]
+
+    def _can_apply_unary(self):
+        if len(self.stack) < 1:
+            return False
+        t, _ = self.stack[-1]
+        return t == self.STACK_EXPR
+
+    def _can_apply_unary_with_int(self):
+        if len(self.stack) < 2:
+            return False
+        t_int, _ = self.stack[-1]
+        t_expr, _ = self.stack[-2]
+        return t_expr == self.STACK_EXPR and t_int == self.STACK_INT
+
+    def _can_apply_binary(self):
+        if len(self.stack) < 2:
+            return False
+        t2, _ = self.stack[-1]
+        t1, _ = self.stack[-2]
+        return t1 == self.STACK_EXPR and t2 == self.STACK_EXPR
+
+    def _can_end(self):
+        return len(self.stack) == 1 and self.stack[0][0] == self.STACK_EXPR
+
+    def _apply_unary(self):
+        t, depth = self.stack.pop()
+        new_depth = depth + 1
+        self.stack.append((self.STACK_EXPR, new_depth))
+
+    def _apply_unary_with_int(self):
+        t_int, depth_int = self.stack.pop()
+        t_expr, depth_expr = self.stack.pop()
+        new_depth = max(depth_expr, depth_int) + 1
+        self.stack.append((self.STACK_EXPR, new_depth))
+
+    def _apply_binary(self):
+        t2, depth2 = self.stack.pop()
+        t1, depth1 = self.stack.pop()
+        new_depth = max(depth1, depth2) + 1
+        self.stack.append((self.STACK_EXPR, new_depth))
+
+    def _count_stack(self):
+        expr_count = 0
+        int_count = 0
+        for t, _ in self.stack:
+            if t == self.STACK_EXPR:
+                expr_count += 1
+            elif t == self.STACK_INT:
+                int_count += 1
+        return expr_count, int_count
+
+    def _min_steps_to_reduce(self, expr_count, int_count):
+        if expr_count <= 0:
+            return float("inf")
+        return int_count + max(0, expr_count - 1)
+
+    def _can_finish_after_action(self, expr_count, int_count, remaining_steps):
+        if expr_count <= 0 or int_count < 0:
+            return False
+        min_steps = self._min_steps_to_reduce(expr_count, int_count)
+        return min_steps <= remaining_steps

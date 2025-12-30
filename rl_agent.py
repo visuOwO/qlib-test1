@@ -15,7 +15,7 @@ from dqn_model import DQN, RNN_DQN
 class DeepQLearningAgent:
     def __init__(self, env, hidden_dim=128, lr=1e-3, gamma=0.99, epsilon=1.0):
         self.env = env
-        self.builder = FactorBuilder(max_depth=5, features=env.raw_features)
+        self.builder = FactorBuilder(max_seq_len=20, features=env.raw_features)
         
         self.action_dim = len(self.builder.action_map)
         
@@ -29,7 +29,7 @@ class DeepQLearningAgent:
         
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
         self.memory = collections.deque(maxlen=2000)
-        self.validator = FactorValidator()
+        self.validator = FactorValidator(max_feature_repeat=3)
         
         self.gamma = gamma
         self.epsilon = epsilon
@@ -114,7 +114,7 @@ class DeepQLearningAgent:
             ) # 传递参数
         ) as executor:
             
-            while valid_count < target_valid_episodes and total_attempts < max_attempts:
+            while (valid_count < target_valid_episodes and total_attempts < max_attempts) or pending_futures:
                 did_work = False
                 
                 # --- 1. Process Completed Futures ---
@@ -132,7 +132,7 @@ class DeepQLearningAgent:
                         is_correlated = abs(price_corr) > 0.6
 
                         # === [新增] 单调性检查 ===
-                        is_monotonic = monotonicity > 0.1
+                        is_monotonic = monotonicity > 0.0
 
                         if ir > best_ir and not is_correlated and is_monotonic:
                             best_ir = ir
@@ -164,6 +164,7 @@ class DeepQLearningAgent:
                         reward = -2.0 # Penalty for causing an error
 
                     self.memory.append((state, action, reward, next_state, done))
+                    print("Optimizing model......")
                     self.optimize_model()
 
                 # --- 2. Generate New Factors if Pool has Capacity ---
@@ -171,6 +172,9 @@ class DeepQLearningAgent:
                     did_work = True # 提交了新任务
                     state = self.builder.reset()
                     total_attempts += 1
+                    
+                    # Epsilon Decay (Decay per episode/attempt)
+                    self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
                     
                     # Generate one full expression
                     done = False
@@ -211,16 +215,14 @@ class DeepQLearningAgent:
                         
                         temp_state = next_temp_state
 
-                # Epsilon Decay
-                self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-                
                 # Target Network Update & Progress Print
-                if total_attempts % 10 == 0 and total_attempts > 0:
-                    self.target_net.load_state_dict(self.policy_net.state_dict())
-                    print(f"Progress: {valid_count}/{target_valid_episodes} Valid | Attempts: {total_attempts} | Pending: {len(pending_futures)} | Epsilon: {self.epsilon:.2f}")
+                if total_attempts % 10 == 0 and total_attempts > 0 and did_work:
+                     self.target_net.load_state_dict(self.policy_net.state_dict())
+                     print(f"Progress: {valid_count}/{target_valid_episodes} Valid | Attempts: {total_attempts} | Pending: {len(pending_futures)} | Epsilon: {self.epsilon:.2f}")
 
                 if not did_work:
-                    time.sleep(0.1)
+                    # time.sleep(0.1)
+                    pass
 
         print("\n--- Training Complete ---")
         print(f"Total Attempts: {total_attempts}")
