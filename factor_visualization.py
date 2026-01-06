@@ -10,6 +10,9 @@ from qlib.config import C
 from pathlib import Path
 from typing import Optional, Union
 
+from factor_env import expand_vwap_expression, expand_vwap_expressions
+from linear_model import fit_linear_ic
+
 DEFAULT_CSI500_MEMBERSHIP = Path("./qlib_meta/csi500_membership.csv")
 
 
@@ -33,9 +36,10 @@ def _set_chinese_font():
 
 def prepare_factor_data(expr: str, start: str, end: str, benchmark: str) -> pd.DataFrame:
     # Pull factor, industry, size and next-day return
+    expanded_expr = expand_vwap_expression(expr)
     factor_df = D.features(
         D.instruments("all"),
-        [expr, "$industry", "$circ_mv", "Ref($close, -1)/$close - 1"],
+        [expanded_expr, "$industry", "$circ_mv", "Ref($close, -1)/$close - 1"],
         start_time=start,
         end_time=end,
         freq="day",
@@ -49,6 +53,68 @@ def prepare_factor_data(expr: str, start: str, end: str, benchmark: str) -> pd.D
 
     factor_df = factor_df.dropna()
     return factor_df
+
+
+def _normalize_expressions(expr_items) -> list[str]:
+    expressions = []
+    for item in expr_items:
+        parts = item.split(",")
+        for part in parts:
+            expr = part.strip()
+            if expr:
+                expressions.append(expr)
+    return expressions
+
+
+def _select_expressions(expressions: list[str], max_factors: Optional[int]) -> list[str]:
+    seen = set()
+    deduped = []
+    for expr in expressions:
+        if expr in seen:
+            continue
+        seen.add(expr)
+        deduped.append(expr)
+
+    if max_factors is None:
+        return deduped
+
+    if len(deduped) <= max_factors:
+        print(f"可用因子不足 {max_factors} 个，使用全部 {len(deduped)} 个因子进行线性拟合。")
+        return deduped
+
+    return deduped[:max_factors]
+
+
+def prepare_linear_model_data(
+    expressions: list[str],
+    weights: dict[str, float],
+    start: str,
+    end: str,
+    benchmark: str,
+) -> pd.DataFrame:
+    expanded_exprs, rename_map = expand_vwap_expressions(expressions)
+    factor_name_map = {expr: f"factor_{i}" for i, expr in enumerate(expressions)}
+
+    fields = expanded_exprs + ["$industry", "$circ_mv", "Ref($close, -1)/$close - 1"]
+    factor_df = D.features(
+        D.instruments("all"),
+        fields,
+        start_time=start,
+        end_time=end,
+        freq="day",
+    ).copy()
+
+    if rename_map:
+        factor_df = factor_df.rename(columns=rename_map)
+
+    factor_df = factor_df.rename(columns=factor_name_map)
+    factor_df = factor_df.rename(columns={"Ref($close, -1)/$close - 1": "target"})
+
+    if benchmark.upper() in factor_df.index.get_level_values("instrument"):
+        factor_df = factor_df.drop(benchmark.upper(), level="instrument")
+
+    factor_df = factor_df.dropna()
+    return factor_df, list(factor_name_map.values()), [weights.get(expr, 0.0) for expr in expressions]
 
 def _ts_code_to_qlib_instrument(ts_code: str) -> str:
     parts = ts_code.split(".")
@@ -153,6 +219,52 @@ def neutralize_factor(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def neutralize_factors(df: pd.DataFrame, factor_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    df = df.copy()
+    df["log_mkt_cap"] = np.log(df["$circ_mv"] + 1)
+
+    def clip_outliers(series: pd.Series) -> pd.Series:
+        mean = series.mean()
+        std = series.std()
+        return series.clip(mean - 3 * std, mean + 3 * std)
+
+    def regress_out_size(df_day: pd.DataFrame, factor_col: str) -> pd.Series:
+        y = df_day[factor_col].values
+        x = df_day["log_mkt_cap"].values
+        mask = ~np.isnan(y) & ~np.isnan(x)
+        if np.sum(mask) < 10:
+            return pd.Series(0, index=df_day.index)
+
+        x_valid = x[mask]
+        y_valid = y[mask]
+        x_mean = x_valid.mean()
+        y_mean = y_valid.mean()
+        numerator = np.sum((x_valid - x_mean) * (y_valid - y_mean))
+        denominator = np.sum((x_valid - x_mean) ** 2)
+        slope = 0 if denominator == 0 else numerator / denominator
+        intercept = y_mean - slope * x_mean
+        resid = y - (slope * x + intercept)
+        return pd.Series(resid, index=df_day.index)
+
+    def industry_standardize(series: pd.Series) -> pd.Series:
+        return (series - series.mean()) / (series.std() + 1e-9)
+
+    neu_cols = []
+    for col in factor_cols:
+        raw_col = f"{col}_raw"
+        size_col = f"{col}_size_neu"
+        neu_col = f"{col}_neu"
+
+        df[raw_col] = df.groupby(level="datetime")[col].transform(clip_outliers).fillna(0)
+        df[size_col] = df.groupby(level="datetime", group_keys=False).apply(
+            lambda df_day: regress_out_size(df_day, raw_col)
+        )
+        df[neu_col] = df.groupby(["datetime", "$industry"])[size_col].transform(industry_standardize).fillna(0)
+        neu_cols.append(neu_col)
+
+    return df, neu_cols
+
+
 def calc_group_returns(df: pd.DataFrame, group_num: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = df.copy()
 
@@ -191,11 +303,58 @@ def calc_turnover(df: pd.DataFrame, focus_group: int) -> pd.Series:
     return pd.Series(turnover_list, index=pd.to_datetime(dates)).sort_index()
 
 
-def visualize_factor(expr: str, start: str, end: str, provider: str, benchmark: str = "sh000300", groups: int = 5, focus_group: int = 4, csi500_membership: Optional[Union[str, Path]] = DEFAULT_CSI500_MEMBERSHIP):
+def visualize_linear_model(
+    expressions: list[str],
+    fit_start: str,
+    fit_end: str,
+    start: str,
+    end: str,
+    provider: str,
+    benchmark: str = "sh000300",
+    groups: int = 5,
+    focus_group: int = 4,
+    csi500_membership: Optional[Union[str, Path]] = DEFAULT_CSI500_MEMBERSHIP,
+    max_factors: Optional[int] = None,
+):
     _set_chinese_font()
     init_qlib(provider)
-    df = prepare_factor_data(expr, start, end, benchmark)
-    df = neutralize_factor(df)
+
+    expressions = _select_expressions(expressions, max_factors)
+    if not expressions:
+        raise ValueError("未找到可用于拟合的因子表达式。")
+
+    weights_ic, weights = fit_linear_ic(
+        factor_expressions=expressions,
+        start_date=fit_start,
+        end_date=fit_end,
+        provider_uri=provider,
+        csi500_membership_path=csi500_membership,
+    )
+    if not weights:
+        raise ValueError("线性模型拟合失败，请检查因子表达式和数据源。")
+    if weights_ic is None or np.isnan(weights_ic):
+        weights_ic = -1.0
+
+    df, factor_cols, weight_list = prepare_linear_model_data(
+        expressions=expressions,
+        weights=weights,
+        start=start,
+        end=end,
+        benchmark=benchmark,
+    )
+    df, neu_cols = neutralize_factors(df, factor_cols)
+
+    pred = np.zeros(len(df), dtype=float)
+    for weight, col in zip(weight_list, neu_cols):
+        if weight == 0:
+            continue
+        pred += weight * df[col].values
+
+    df["raw_factor"] = pred
+    df["neu_factor"] = df.groupby(level="datetime")["raw_factor"].transform(
+        lambda s: (s - s.mean()) / (s.std() + 1e-9)
+    )
+    df["neu_factor"] = df["neu_factor"].fillna(0)
     csi500_index = load_csi500_membership(csi500_membership)
     if csi500_index is not None:
         in_membership = align_membership_index(df.index, csi500_index)
@@ -224,7 +383,7 @@ def visualize_factor(expr: str, start: str, end: str, provider: str, benchmark: 
     fig, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
 
     (1 + group_ret).cumprod().plot(ax=axes[0])
-    axes[0].set_title(f"{expr} 分层累计收益 (分组数={groups})")
+    axes[0].set_title(f"线性模型分层累计收益 (因子数={len(expressions)}, 分组数={groups})")
     axes[0].set_ylabel("Net Value")
     axes[0].grid(True)
 
@@ -232,7 +391,7 @@ def visualize_factor(expr: str, start: str, end: str, provider: str, benchmark: 
     bench_cum = (1 + bench_ret).cumprod()
     axes[1].plot(focus_cum.index, focus_cum, label=f"Group {focus_group} 累计收益")
     axes[1].plot(bench_cum.index, bench_cum, label=f"{benchmark} 累计收益", alpha=0.7)
-    axes[1].set_title(f"组 {focus_group} 累计收益 vs 基准")
+    axes[1].set_title(f"组 {focus_group} 累计收益 vs 基准 (拟合IC={weights_ic:.4f})")
     axes[1].set_ylabel("Net Value")
     axes[1].legend()
     axes[1].grid(True)
@@ -250,7 +409,7 @@ def visualize_factor(expr: str, start: str, end: str, provider: str, benchmark: 
     axes[3].grid(True)
 
     fig.autofmt_xdate()
-    save_path = os.path.join("analysis_results", "factor_visualization.png")
+    save_path = os.path.join("analysis_results", "linear_model_visualization.png")
     plt.tight_layout()
     plt.savefig(save_path)
     print(f"图表已保存到: {save_path}")
@@ -258,19 +417,28 @@ def visualize_factor(expr: str, start: str, end: str, provider: str, benchmark: 
 
 
 def main():
-    parser = argparse.ArgumentParser(description="可视化因子的分层收益、换手率和每日收益。")
-    parser.add_argument("expression", help='因子表达式，例如 Div($close, Ref($close, 1))')
+    parser = argparse.ArgumentParser(description="可视化线性模型的分层收益、换手率和每日收益。")
+    parser.add_argument("expressions", nargs="+", help='因子表达式列表，空格或逗号分隔，例如 "Div($close, Ref($close, 1))" "$vwap"')
     parser.add_argument("--start", default="2023-01-01", help="开始日期 YYYY-MM-DD")
     parser.add_argument("--end", default="2024-01-01", help="结束日期 YYYY-MM-DD")
+    parser.add_argument("--fit_start", default=None, help="拟合开始日期 YYYY-MM-DD，默认等于 start")
+    parser.add_argument("--fit_end", default=None, help="拟合结束日期 YYYY-MM-DD，默认等于 end")
     parser.add_argument("--provider", default="./qlib_bin_data", help="Qlib 数据目录")
     parser.add_argument("--benchmark", default="sh000300", help="基准代码，例如 sh000300")
     parser.add_argument("--groups", type=int, default=5, help="分层数量")
     parser.add_argument("--focus_group", type=int, default=4, help="关注的分组编号（0-index）")
     parser.add_argument("--csi500_membership", default=str(DEFAULT_CSI500_MEMBERSHIP), help="CSI500 成分股路径")
+    parser.add_argument("--max_factors", type=int, default=None, help="最多使用的因子数量，缺少时自动使用全部找到的因子")
     args = parser.parse_args()
 
-    visualize_factor(
-        expr=args.expression,
+    expressions = _normalize_expressions(args.expressions)
+    fit_start = args.fit_start or args.start
+    fit_end = args.fit_end or args.end
+
+    visualize_linear_model(
+        expressions=expressions,
+        fit_start=fit_start,
+        fit_end=fit_end,
         start=args.start,
         end=args.end,
         provider=args.provider,
@@ -278,6 +446,7 @@ def main():
         groups=args.groups,
         focus_group=args.focus_group,
         csi500_membership=args.csi500_membership,
+        max_factors=args.max_factors,
     )
 
 

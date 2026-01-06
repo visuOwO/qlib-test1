@@ -17,7 +17,7 @@ class FactorBuilder:
         
         # Unary Ops needing a Window (Int)
         # Added: Slope, EMA, WMA, ROC (Rate of Change), Rank
-        self.ops_unary_win = ["Mean", "Std", "Max", "Min", "Slope", "EMA", "WMA", "Rank", "Ts_Rank"] 
+        self.ops_unary_win = ["Mean", "Std", "Max", "Min", "Slope", "EMA", "WMA", "Rank"] 
         
         # Unary Ops needing an Offset (Int)
         # Added: Delta (Temp Removed)

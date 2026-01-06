@@ -9,33 +9,40 @@ import os
 import time
 from factor_builder import FactorBuilder
 from factor_validator import FactorValidator
-from factor_env import evaluate_factor_mp, init_worker
+from factor_env import init_worker
 from dqn_model import DQN, RNN_DQN
+from linear_model import fit_linear_ic, evaluate_factor_quality
+
+import traceback
 
 class DeepQLearningAgent:
-    def __init__(self, env, hidden_dim=128, lr=1e-3, gamma=0.99, epsilon=1.0):
+    def __init__(self, env, hidden_dim=128, lr=1e-3, gamma=0.99, epsilon=1.0, top_k=10):
         self.env = env
         self.builder = FactorBuilder(max_seq_len=20, features=env.raw_features)
-        
+
         self.action_dim = len(self.builder.action_map)
-        
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Agent using device: {self.device}")
-        
+
         self.policy_net = RNN_DQN(action_dim=self.action_dim, hidden_dim=hidden_dim).to(self.device)
         self.target_net = RNN_DQN(action_dim=self.action_dim, hidden_dim=hidden_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
-        
+
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
         self.memory = collections.deque(maxlen=2000)
         self.validator = FactorValidator(max_feature_repeat=3)
-        
+
         self.gamma = gamma
         self.epsilon = epsilon
         self.epsilon_min = 0.05
         self.epsilon_decay = 0.995
         self.batch_size = 64
+
+        # Top K 因子设置
+        self.top_k = top_k
+        self.top_factors = []  # 存储 dict: expr, ir, ic, icir, mono, weight
 
     def select_action(self, state, valid_actions):
         if random.random() < self.epsilon:
@@ -85,20 +92,125 @@ class DeepQLearningAgent:
         loss.backward()
         self.optimizer.step()
 
+    def _get_top_factor_exprs(self):
+        return [factor["expr"] for factor in self.top_factors]
+
+    def _sync_weights(self, weights_by_expr):
+        for factor in self.top_factors:
+            factor["weight"] = weights_by_expr.get(factor["expr"], 0.0)
+
+    def _update_top_k_with_linear_model(self, new_factor):
+        """
+        使用 Top-K + 新因子做线性拟合，按权重绝对值决定是否替换。
+        返回 (reward, accepted, removed_expr, old_ic, new_ic)
+        """
+        expr = new_factor["expr"]
+        if any(factor["expr"] == expr for factor in self.top_factors):
+            return 0.0, False, None, 0.0, 0.0
+
+        old_exprs = self._get_top_factor_exprs()
+        old_ic = 0.0
+        old_weights = {}
+        if old_exprs:
+            old_ic, old_weights = fit_linear_ic(
+                old_exprs,
+                self.env.start_date,
+                self.env.end_date,
+                provider_uri=self.env.provider_uri,
+                csi500_membership_path=self.env.csi500_membership_path,
+            )
+            if old_ic is None:
+                return -2.0, False, None, 0.0, 0.0
+
+        if len(old_exprs) < self.top_k:
+            new_exprs = old_exprs + [expr]
+            new_ic, new_weights = fit_linear_ic(
+                new_exprs,
+                self.env.start_date,
+                self.env.end_date,
+                provider_uri=self.env.provider_uri,
+                csi500_membership_path=self.env.csi500_membership_path,
+            )
+            if new_ic is None:
+                return -2.0, False, None, old_ic, old_ic
+            self.top_factors.append(new_factor)
+            self._sync_weights(new_weights)
+            return new_ic - old_ic, True, None, old_ic, new_ic
+
+        candidate_exprs = old_exprs + [expr]
+        candidate_ic, candidate_weights = fit_linear_ic(
+            candidate_exprs,
+            self.env.start_date,
+            self.env.end_date,
+            provider_uri=self.env.provider_uri,
+            csi500_membership_path=self.env.csi500_membership_path,
+        )
+        if candidate_ic is None:
+            self._sync_weights(old_weights)
+            return -2.0, False, None, old_ic, old_ic
+
+        new_weight = abs(candidate_weights.get(expr, 0.0))
+        min_expr = min(old_exprs, key=lambda e: abs(candidate_weights.get(e, 0.0)))
+        min_weight = abs(candidate_weights.get(min_expr, 0.0))
+
+        if new_weight < min_weight:
+            self._sync_weights(old_weights)
+            return 0.0, False, None, old_ic, old_ic
+
+        updated_exprs = [e for e in old_exprs if e != min_expr] + [expr]
+        new_ic, new_weights = fit_linear_ic(
+            updated_exprs,
+            self.env.start_date,
+            self.env.end_date,
+            provider_uri=self.env.provider_uri,
+            csi500_membership_path=self.env.csi500_membership_path,
+        )
+        if new_ic is None:
+            self._sync_weights(old_weights)
+            return -2.0, False, None, old_ic, old_ic
+
+        self.top_factors = [factor for factor in self.top_factors if factor["expr"] != min_expr]
+        self.top_factors.append(new_factor)
+        self._sync_weights(new_weights)
+        return new_ic - old_ic, True, min_expr, old_ic, new_ic
+
+    def _save_top_factors(self, filepath="factors.txt"):
+        """保存 top k 因子到文件"""
+        if not self.top_factors:
+            print("No factors to save.")
+            return
+
+        # 获取脚本所在目录的父目录（即项目根目录）
+        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        output_path = os.path.join(script_dir, filepath)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(f"# Top {len(self.top_factors)} Factors (linear model weight-based)\n")
+            f.write(f"# Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("# Format: Weight | IR | IC | ICIR | Monotonicity | Expression\n")
+            f.write("=" * 80 + "\n\n")
+
+            for i, factor in enumerate(self.top_factors, 1):
+                f.write(
+                    f"{i}. Weight={factor.get('weight', 0.0):.6f} | IR={factor['ir']:.4f} | "
+                    f"IC={factor['ic']:.4f} | ICIR={factor['icir']:.4f} | Mono={factor['mono']:.4f}\n"
+                )
+                f.write(f"   {factor['expr']}\n\n")
+
+        print(f"Top {len(self.top_factors)} factors saved to: {output_path}")
+
     def train(self, target_valid_episodes=50, max_attempts=1000, num_workers=None):
         if num_workers is None:
             num_workers = os.cpu_count()
-        
+
         print(f"\n--- Starting Parallel Deep Q-Learning (Target: {target_valid_episodes} Valid Factors, Workers: {num_workers}) ---")
-        
-        best_ir = -float('inf')
-        best_ic = -float('inf')
-        best_factor = ""
-        best_icir = -float('inf')
+
+        # 重置 top k 因子列表
+        self.top_factors = []
+
         valid_count = 0
         total_attempts = 0
-        best_mono = 0
-        
+
         seen_factors = set()
         pending_futures = {}  # future -> (state, action, next_state, done, expr)
 
@@ -127,41 +239,51 @@ class DeepQLearningAgent:
                     state, action, next_state, done, expr = pending_futures.pop(future)
                     
                     try:
-                        ir, ic, icir, price_corr, monotonicity = future.result()
-                        
+                        price_corr, monotonicity = future.result()
+                        if price_corr is None or monotonicity is None:
+                            raise ValueError("Factor quality evaluation failed.")
+
                         is_correlated = abs(price_corr) > 0.6
 
                         # === [新增] 单调性检查 ===
                         is_monotonic = monotonicity > 0.0
 
-                        if ir > best_ir and not is_correlated and is_monotonic:
-                            best_ir = ir
-                            best_ic = ic
-                            best_icir = icir
-                            best_factor = expr
-                            best_mono = monotonicity
-                            print(f"New Best! IR: {best_ir:.4f} | IC: {best_ic:.4f} | ICIR: {icir:.4f} | Corr: {price_corr:.4f} | Mono:{monotonicity:.2f} | {expr}")
-
                         if is_correlated:
                             reward = -5.0
-                        elif ir > 0.2:
-                            base_reward = ir * 20
-    
-                            # 单调性作为加分项：
-                            # 如果单调性好，奖励大幅增加；如果不好，不扣分或少扣分
-                            # max(0, monotonicity) 确保单调性为负时不至于扣太多分，或者允许负向单调
-
-                            mono_bonus = max(0, monotonicity) * 10 
-                            
-                            reward = base_reward + mono_bonus
-                            print(f"Valid & New: {expr} | IC: {ic:.4f} | ICIR: {icir:.4f} | Mono:{monotonicity:.2f}")
-                            valid_count += 1
-                        else:
+                        elif not is_monotonic:
                             reward = -1.0
+                        else:
+                            new_factor = {
+                                "expr": expr,
+                                "ir": 0.0,
+                                "ic": 0.0,
+                                "icir": 0.0,
+                                "mono": monotonicity,
+                                "weight": 0.0,
+                            }
+                            reward, accepted, removed_expr, old_ic, new_ic = self._update_top_k_with_linear_model(new_factor)
+                            if accepted:
+                                valid_count += 1
+                                if removed_expr:
+                                    print(
+                                        f"Top-K Replaced: {removed_expr} -> {expr} | "
+                                        f"Delta IC: {reward:.4f} (old IC={old_ic:.4f}, new IC={new_ic:.4f})"
+                                    )
+                                else:
+                                    print(
+                                        f"Top-K Added: {expr} | "
+                                        f"Delta IC: {reward:.4f} (old IC={old_ic:.4f}, new IC={new_ic:.4f})"
+                                    )
+                            else:
+                                print(
+                                    f"Top-K Unchanged: {expr} | "
+                                    f"Delta IC: {reward:.4f} (old IC={old_ic:.4f}, new IC={new_ic:.4f})"
+                                )
                             
                     except Exception as e:
                         print(f"Error evaluating factor {expr}: {e}")
                         reward = -2.0 # Penalty for causing an error
+                        traceback.print_exc()
 
                     self.memory.append((state, action, reward, next_state, done))
                     print("Optimizing model......")
@@ -202,10 +324,12 @@ class DeepQLearningAgent:
                                 seen_factors.add(expr)
                                 print(f"Attempt {total_attempts} (Submitting for Eval): {expr}")
                                 future = executor.submit(
-                                    evaluate_factor_mp, 
+                                    evaluate_factor_quality,
                                     expr, 
                                     self.env.start_date, 
-                                    self.env.end_date
+                                    self.env.end_date,
+                                    self.env.provider_uri,
+                                    self.env.csi500_membership_path,
                                 )
                                 pending_futures[future] = (prev_state, action, next_temp_state, done, expr)
                         else:
@@ -227,17 +351,25 @@ class DeepQLearningAgent:
         print("\n--- Training Complete ---")
         print(f"Total Attempts: {total_attempts}")
         print(f"Valid Factors Generated: {valid_count}")
-        print(f"Best Factor: {best_factor}")
-        print(f"Best IR: {best_ir:.4f}")
-        print(f"Best IC: {best_ic:.4f}")
-        print(f"Best ICIR: {best_icir:.4f}")
-        print(f"Monotonicity of best factor: {best_mono:.4f}")
+
+        # 保存 top k 因子到文件
+        self._save_top_factors("factors.txt")
+
+        # 打印 top k 因子摘要
+        if self.top_factors:
+            print(f"\n=== Top {len(self.top_factors)} Factors ===")
+            for i, factor in enumerate(self.top_factors, 1):
+                print(
+                    f"{i}. Weight={factor.get('weight', 0.0):.6f} | IR={factor['ir']:.4f} | "
+                    f"IC={factor['ic']:.4f} | ICIR={factor['icir']:.4f} | Mono={factor['mono']:.4f}"
+                )
+                print(f"   {factor['expr']}")
 
         return {
-            "best_factor": best_factor,
-            "best_ir": best_ir,
-            "best_ic": best_ic,
-            "best_icir": best_icir,
+            "top_factors": [
+                (f["expr"], f["ir"], f["ic"], f["icir"], f["mono"], f.get("weight", 0.0))
+                for f in self.top_factors
+            ],  # (expr, ir, ic, icir, mono, weight)
             "total_attempts": total_attempts,
             "valid_count": valid_count,
         }

@@ -271,12 +271,14 @@ class FactorValidator:
             # 规则 E: 时序函数与窗口检查 (分拆逻辑)
             
             # 1. 聚合类函数: Window=1 是废话 (等于自身)
-            if func_name in ['Mean', 'EMA', 'WMA', 'Max', 'Min', 'Sum', 'Rank', 'Ts_Rank']:
+            if func_name in ['Mean', 'EMA', 'WMA', 'Max', 'Min', 'Sum', 'Rank']:
+                if len(args) < 2:
+                    return FactorType.ERROR
                 window_node = args[1]
                 if isinstance(window_node, ast.Constant) and window_node.value == 1:
                     return FactorType.ERROR
                 # Rank($close, 10) -> RATIO (百分比)
-                if func_name in ['Rank', 'Ts_Rank']:
+                if func_name in ['Rank']:
                     return FactorType.RATIO_PCT
                 return arg_types[0] # 保持输入类型
 

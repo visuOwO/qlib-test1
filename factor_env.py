@@ -3,6 +3,7 @@ import argparse
 import pandas as pd
 import numpy as np
 import traceback
+import re
 from pathlib import Path
 from typing import Optional, Union
 from qlib.data import D
@@ -10,6 +11,24 @@ from qlib.config import C
 
 _WORKER_CACHE = {}
 DEFAULT_CSI500_MEMBERSHIP = Path("./qlib_meta/csi500_membership.csv")
+_VWAP_EXPR = "Div($amount, $volume)"
+
+
+def expand_vwap_expression(expression: str) -> str:
+    if "$vwap" not in expression:
+        return expression
+    return re.sub(r"\$vwap\b", _VWAP_EXPR, expression)
+
+
+def expand_vwap_expressions(expressions):
+    expanded = []
+    rename_map = {}
+    for expr in expressions:
+        expanded_expr = expand_vwap_expression(expr)
+        expanded.append(expanded_expr)
+        if expanded_expr != expr:
+            rename_map[expanded_expr] = expr
+    return expanded, rename_map
 
 def _ts_code_to_qlib_instrument(ts_code: str) -> str:
     parts = ts_code.split(".")
@@ -123,13 +142,16 @@ def evaluate_factor_mp(factor_expression: str, start_date: str, end_date: str) -
         try:
             # 注意：这里我们依然需要 $close 和 $industry
             # Qlib 的 D.features 会处理对齐，所以这里重新读取 $close 开销是可以接受的，或者也可以进一步优化缓存
+            expanded_expr, rename_map = expand_vwap_expressions([factor_expression])
             factor_df = D.features(
                 D.instruments("all"),
-                [factor_expression, "$close", "$industry", "$circ_mv"], 
+                expanded_expr + ["$close", "$industry", "$circ_mv"],
                 start_time=start_date,
                 end_time=end_date,
                 freq="day"
             )
+            if rename_map:
+                factor_df = factor_df.rename(columns=rename_map)
         except Exception as e:
             # 公式错误等情况
             return -1.0, -1.0, -1.0, -1.0, -1.0
@@ -300,7 +322,7 @@ class FactorMiningEnv:
             print(f"Qlib initialized with data from: {provider_uri}")
 
         self.raw_features = [
-            "$open", "$high", "$low", "$close", "$volume", "$amount", 
+            "$open", "$high", "$low", "$close", "$vwap", "$volume", "$amount", 
             "$turnover_rate", "$turnover_rate_f", "$volume_ratio",
             "$pe_ttm", "$pb", "$ps_ttm", "$dv_ttm",
             "$total_mv", "$circ_mv"
