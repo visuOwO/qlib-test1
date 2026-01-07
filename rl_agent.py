@@ -18,7 +18,7 @@ import traceback
 class DeepQLearningAgent:
     def __init__(self, env, hidden_dim=128, lr=1e-3, gamma=0.99, epsilon=1.0, top_k=10):
         self.env = env
-        self.builder = FactorBuilder(max_seq_len=20, features=env.raw_features)
+        self.builder = FactorBuilder(max_seq_len=10, features=env.raw_features)
 
         self.action_dim = len(self.builder.action_map)
 
@@ -43,6 +43,8 @@ class DeepQLearningAgent:
         # Top K 因子设置
         self.top_k = top_k
         self.top_factors = []  # 存储 dict: expr, ir, ic, icir, mono, weight
+
+        self.ic_scale = 1000    # IC放大倍数
 
     def select_action(self, state, valid_actions):
         if random.random() < self.epsilon:
@@ -243,7 +245,7 @@ class DeepQLearningAgent:
                         if price_corr is None or monotonicity is None:
                             raise ValueError("Factor quality evaluation failed.")
 
-                        is_correlated = abs(price_corr) > 0.6
+                        is_correlated = abs(price_corr) > 0.9
 
                         # === [新增] 单调性检查 ===
                         is_monotonic = monotonicity > 0.0
@@ -261,9 +263,16 @@ class DeepQLearningAgent:
                                 "mono": monotonicity,
                                 "weight": 0.0,
                             }
-                            reward, accepted, removed_expr, old_ic, new_ic = self._update_top_k_with_linear_model(new_factor)
+                            delta_ic, accepted, removed_expr, old_ic, new_ic = self._update_top_k_with_linear_model(new_factor)
+
                             if accepted:
                                 valid_count += 1
+
+                                base_reward = 1.0  # 只要被接受，保底给 1 分
+
+                                scaled_gain = delta_ic * self.ic_scale
+                                reward = base_reward + scaled_gain
+
                                 if removed_expr:
                                     print(
                                         f"Top-K Replaced: {removed_expr} -> {expr} | "
@@ -314,11 +323,11 @@ class DeepQLearningAgent:
                             if not self.validator.validate(expr):
                                 reward = -10.0
                                 self.memory.append((prev_state, action, reward, next_temp_state, done))
+                                print(f"Total attempts: {total_attempts}, Invalid factor generated: {expr}.")
                                 self.optimize_model()
                             elif expr in seen_factors:
-                                reward = -5.0
-                                self.memory.append((prev_state, action, reward, next_temp_state, done))
-                                self.optimize_model()
+                                print(f"Total attempts: {total_attempts}, Duplicate factor generated: {expr}. Skipping update.")
+                                pass
                             else:
                                 # This is a new, valid factor to be evaluated
                                 seen_factors.add(expr)
@@ -345,7 +354,6 @@ class DeepQLearningAgent:
                      print(f"Progress: {valid_count}/{target_valid_episodes} Valid | Attempts: {total_attempts} | Pending: {len(pending_futures)} | Epsilon: {self.epsilon:.2f}")
 
                 if not did_work:
-                    # time.sleep(0.1)
                     pass
 
         print("\n--- Training Complete ---")
