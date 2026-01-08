@@ -10,7 +10,7 @@ import time
 from factor_builder import FactorBuilder
 from factor_validator import FactorValidator
 from factor_env import init_worker
-from dqn_model import DQN, RNN_DQN
+from dqn_model import DQN, RNN_DQN, RNN_DQN_Combined
 from linear_model import fit_linear_ic, evaluate_factor_quality
 
 import traceback
@@ -22,13 +22,15 @@ class DeepQLearningAgent:
 
         self.action_dim = len(self.builder.action_map)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else ("xpu" if torch.xpu.is_available() else "cpu"))
         print(f"Agent using device: {self.device}")
 
-        self.policy_net = RNN_DQN(action_dim=self.action_dim, hidden_dim=hidden_dim).to(self.device)
-        self.target_net = RNN_DQN(action_dim=self.action_dim, hidden_dim=hidden_dim).to(self.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
+        # 使用组合模型：RNN 处理因子序列 + DQN 选择动作（单网络模式）
+        self.policy_net = RNN_DQN_Combined(
+            action_dim=self.action_dim, 
+            rnn_hidden_dim=hidden_dim, 
+            dqn_hidden_dim=hidden_dim
+        ).to(self.device)
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
         self.memory = collections.deque(maxlen=2000)
@@ -77,13 +79,10 @@ class DeepQLearningAgent:
         # Compute Q(s, a)
         q_values = self.policy_net(state_batch).gather(1, action_batch)
 
-        # Compute V(s_{t+1}) for all next states.
+        # Compute V(s_{t+1}) for all next states using policy_net (单网络模式)
         with torch.no_grad():
-            # 1. 用 Policy Net 决定哪个动作最好 (argmax)
-            next_actions = self.policy_net(next_state_batch).argmax(1).unsqueeze(1)
-            
-            # 2. 用 Target Net 计算这个动作的价值
-            next_state_values = self.target_net(next_state_batch).gather(1, next_actions)
+            # 直接用 policy_net 计算下一状态的最大 Q 值
+            next_state_values = self.policy_net(next_state_batch).max(1)[0].unsqueeze(1)
         
         # Compute expected Q
         expected_q_values = reward_batch + (self.gamma * next_state_values * (1 - done_batch))
@@ -348,9 +347,7 @@ class DeepQLearningAgent:
                         
                         temp_state = next_temp_state
 
-                # Target Network Update & Progress Print
                 if total_attempts % 10 == 0 and total_attempts > 0 and did_work:
-                     self.target_net.load_state_dict(self.policy_net.state_dict())
                      print(f"Progress: {valid_count}/{target_valid_episodes} Valid | Attempts: {total_attempts} | Pending: {len(pending_futures)} | Epsilon: {self.epsilon:.2f}")
 
                 if not did_work:

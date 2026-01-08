@@ -24,7 +24,7 @@ if __name__ == "__main__":
     
     # 开始训练
     # 建议增加 episodes 数量以获得更好的结果
-    result = agent.train(target_valid_episodes=1000, max_attempts=100000)
+    result = agent.train(target_valid_episodes=1000, max_attempts=100000, num_workers=8)
     # 记录最佳因子到文件
     os.makedirs("analysis_results", exist_ok=True)
     summary_path = os.path.join("analysis_results", "best_factor_summary.txt")
