@@ -269,9 +269,9 @@ class DeepQLearningAgent:
                         # === [新增] 单调性检查 ===
                         is_monotonic = monotonicity > 0.0
 
-                        if is_correlated:
+                        if False:
                             reward = -5.0
-                        elif not is_monotonic:
+                        elif False:
                             reward = -1.0
                         else:
                             new_factor = {
@@ -465,11 +465,14 @@ class DeepQLearningAgent:
                         if not self.validator.validate(expr):
                             reward = -10.0
                             self.memory.append((prev_state, action, reward, next_temp_state, done))
+                            print(f"Total attempts: {total_attempts}, Invalid factor generated: {expr}.")
                             self.optimize_model()
                         elif expr in seen_factors:
+                            print(f"Total attempts: {total_attempts}, Duplicate factor generated: {expr}. Skipping update.")
                             pass  # 跳过重复因子
                         else:
                             # 有效因子，加入批次
+                            print(f"Attempt {total_attempts} (Submitting for Eval): {expr}")
                             seen_factors.add(expr)
                             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
                             pending_batch.append((prev_state, action, next_temp_state, done, expr))
