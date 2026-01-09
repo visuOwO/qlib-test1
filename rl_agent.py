@@ -415,3 +415,166 @@ class DeepQLearningAgent:
             "total_attempts": total_attempts,
             "valid_count": valid_count,
         }
+
+    def train_gpu(self, target_valid_episodes=50, max_attempts=1000, eval_batch_size=16):
+        """
+        使用 GPU 批量评估的训练方法
+        
+        相比 train() 方法的优势：
+        - 批量评估因子（默认每批 16 个）
+        - GPU 加速的市值/行业中性化
+        - 约 20x 加速
+        
+        Args:
+            target_valid_episodes: 目标有效因子数量
+            max_attempts: 最大尝试次数
+            eval_batch_size: 每批评估的因子数量
+        """
+        # 延迟导入，只在需要时加载
+        from gpu_factor_evaluator import GPUFactorEvaluator
+        
+        print(f"\n--- Starting GPU-Accelerated Training (Target: {target_valid_episodes} Valid Factors, Batch Size: {eval_batch_size}) ---")
+        
+        # 初始化 GPU 评估器
+        gpu_evaluator = GPUFactorEvaluator(
+            start_date=self.env.start_date,
+            end_date=self.env.end_date,
+            provider_uri=self.env.provider_uri,
+            csi500_membership_path=self.env.csi500_membership_path,
+            batch_size=eval_batch_size,
+            device=self.device,
+        )
+        
+        # 如果 GPU 评估器实际使用 CPU，提示用户
+        if not gpu_evaluator.use_gpu:
+            print("[WARNING] GPU not available, using CPU mode (no batch acceleration)")
+        
+        # 重置 top k 因子列表
+        self.top_factors = []
+        
+        valid_count = 0
+        total_attempts = 0
+        seen_factors = set()
+        
+        # 待评估的因子批次
+        pending_batch = []  # [(state, action, next_state, done, expr), ...]
+        
+        while valid_count < target_valid_episodes and total_attempts < max_attempts:
+            # --- 1. 生成因子直到达到批量大小 ---
+            while len(pending_batch) < eval_batch_size and total_attempts < max_attempts:
+                state = self.builder.reset()
+                total_attempts += 1
+                
+                # 生成一个完整的因子表达式
+                done = False
+                temp_state = state
+                while not done:
+                    valid_actions = self.builder.get_valid_actions()
+                    prev_state = temp_state
+                    action = self.select_action(temp_state, valid_actions)
+                    next_temp_state, done = self.builder.step(action)
+                    
+                    if done:
+                        expr = self.builder.build_expression()
+                        
+                        # 预验证检查
+                        if not self.validator.validate(expr):
+                            reward = -10.0
+                            self.memory.append((prev_state, action, reward, next_temp_state, done))
+                            self.optimize_model()
+                        elif expr in seen_factors:
+                            pass  # 跳过重复因子
+                        else:
+                            # 有效因子，加入批次
+                            seen_factors.add(expr)
+                            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+                            pending_batch.append((prev_state, action, next_temp_state, done, expr))
+                    else:
+                        # 中间步骤
+                        self.memory.append((prev_state, action, 0.0, next_temp_state, False))
+                        self.optimize_model()
+                    
+                    temp_state = next_temp_state
+            
+            # --- 2. 批量评估因子 ---
+            if pending_batch:
+                batch_exprs = [item[4] for item in pending_batch]
+                print(f"\n[GPU Batch] Evaluating {len(batch_exprs)} factors...")
+                
+                start_time = time.time()
+                results = gpu_evaluator.evaluate_factors_batch(batch_exprs)
+                eval_time = time.time() - start_time
+                print(f"[GPU Batch] Evaluation took {eval_time:.2f}s ({eval_time/len(batch_exprs):.3f}s per factor)")
+                
+                # 处理每个因子的结果
+                for state, action, next_state, done, expr in pending_batch:
+                    price_corr, monotonicity = results.get(expr, (None, None))
+                    
+                    if price_corr is None or monotonicity is None:
+                        reward = -2.0
+                    elif abs(price_corr) > 0.9:
+                        reward = -5.0
+                    elif monotonicity <= 0.0:
+                        reward = -1.0
+                    else:
+                        # 尝试加入 Top-K
+                        new_factor = {
+                            "expr": expr,
+                            "ir": 0.0,
+                            "ic": 0.0,
+                            "icir": 0.0,
+                            "mono": monotonicity,
+                            "weight": 0.0,
+                        }
+                        delta_ic, accepted, removed_expr, old_ic, new_ic = self._update_top_k_with_linear_model(new_factor)
+                        
+                        if accepted:
+                            valid_count += 1
+                            base_reward = 1.0
+                            scaled_gain = delta_ic * self.ic_scale
+                            reward = base_reward + scaled_gain
+                            
+                            if removed_expr:
+                                print(f"Top-K Replaced: {removed_expr} -> {expr} | Delta IC: {reward:.4f}")
+                            else:
+                                print(f"Top-K Added: {expr} | Delta IC: {reward:.4f}")
+                        else:
+                            reward = 0.0
+                    
+                    self.memory.append((state, action, reward, next_state, done))
+                
+                # 批量优化
+                for _ in range(min(len(pending_batch), 5)):
+                    self.optimize_model()
+                
+                # 清空批次
+                pending_batch.clear()
+                
+                print(f"Progress: {valid_count}/{target_valid_episodes} Valid | Attempts: {total_attempts} | Epsilon: {self.epsilon:.2f}")
+        
+        print("\n--- GPU Training Complete ---")
+        print(f"Total Attempts: {total_attempts}")
+        print(f"Valid Factors Generated: {valid_count}")
+        
+        # 保存 top k 因子
+        self._save_top_factors("factors.txt")
+        
+        # 打印摘要
+        if self.top_factors:
+            print(f"\n=== Top {len(self.top_factors)} Factors ===")
+            for i, factor in enumerate(self.top_factors, 1):
+                print(
+                    f"{i}. Weight={factor.get('weight', 0.0):.6f} | IR={factor['ir']:.4f} | "
+                    f"IC={factor['ic']:.4f} | ICIR={factor['icir']:.4f} | Mono={factor['mono']:.4f}"
+                )
+                print(f"   {factor['expr']}")
+        
+        return {
+            "top_factors": [
+                (f["expr"], f["ir"], f["ic"], f["icir"], f["mono"], f.get("weight", 0.0))
+                for f in self.top_factors
+            ],
+            "total_attempts": total_attempts,
+            "valid_count": valid_count,
+        }
+
