@@ -51,6 +51,177 @@ def _industry_neutralize_and_standardize(series: pd.Series) -> pd.Series:
     return (series - series.mean()) / (series.std() + 1e-9)
 
 
+class LinearModelFitter:
+    """
+    线性模型拟合器，在初始化时缓存数据以加速 fit_linear_ic 调用。
+    
+    特性：
+    - 初始化时缓存 target、$industry、$circ_mv 数据
+    - 缓存 CSI500 成员索引
+    - fit_linear_ic 只需加载因子数据，复用缓存
+    """
+    
+    def __init__(
+        self,
+        start_date: str,
+        end_date: str,
+        provider_uri: str = "./qlib_bin_data",
+        csi500_membership_path=DEFAULT_CSI500_MEMBERSHIP,
+    ):
+        self.start_date = start_date
+        self.end_date = end_date
+        self.provider_uri = provider_uri
+        self.csi500_membership_path = csi500_membership_path
+        
+        _ensure_qlib_initialized(provider_uri)
+        
+        # 预加载并缓存数据
+        self._preload_data()
+    
+    def _preload_data(self):
+        """预加载 target、industry、circ_mv 等数据"""
+        print(f"[LinearModelFitter] Preloading data from {self.start_date} to {self.end_date}...")
+        
+        # 加载目标收益
+        self.target_df = D.features(
+            D.instruments("all"),
+            ["Ref($close, -5) / Ref($close, -1) - 1"],
+            start_time=self.start_date,
+            end_time=self.end_date,
+            freq="day",
+        )
+        self.target_df.columns = ["target"]
+        
+        # 加载基础数据（行业、市值）
+        self.base_df = D.features(
+            D.instruments("all"),
+            ["$industry", "$circ_mv"],
+            start_time=self.start_date,
+            end_time=self.end_date,
+            freq="day",
+        )
+        
+        # 过滤 SH000300
+        if "SH000300" in self.target_df.index.get_level_values("instrument"):
+            self.target_df = self.target_df.drop("SH000300", level="instrument")
+        if "SH000300" in self.base_df.index.get_level_values("instrument"):
+            self.base_df = self.base_df.drop("SH000300", level="instrument")
+        
+        # 预计算 log_mkt_cap
+        self.base_df["log_mkt_cap"] = np.log(self.base_df["$circ_mv"] + 1)
+        
+        # 加载 CSI500 成员索引
+        self.csi500_index = _load_csi500_membership(
+            self.csi500_membership_path or DEFAULT_CSI500_MEMBERSHIP
+        )
+        
+        print(f"[LinearModelFitter] Preloaded: target={self.target_df.shape}, base={self.base_df.shape}")
+    
+    def fit_linear_ic(self, factor_expressions):
+        """
+        使用缓存数据拟合线性模型，返回 (ic_mean, weights_dict)。
+        如果拟合失败，返回 (None, {})。
+        """
+        if not factor_expressions:
+            return 0.0, {}
+        
+        factor_expressions = list(factor_expressions)
+        expanded_exprs, rename_map = expand_vwap_expressions(factor_expressions)
+        factor_name_map = {expr: f"factor_{i}" for i, expr in enumerate(factor_expressions)}
+        
+        # 只加载因子数据
+        try:
+            factor_df = D.features(
+                D.instruments("all"),
+                expanded_exprs,
+                start_time=self.start_date,
+                end_time=self.end_date,
+                freq="day",
+            )
+        except Exception:
+            return None, {}
+        
+        if factor_df.empty:
+            return None, {}
+        
+        # 过滤 SH000300
+        if "SH000300" in factor_df.index.get_level_values("instrument"):
+            factor_df = factor_df.drop("SH000300", level="instrument")
+        
+        if rename_map:
+            factor_df = factor_df.rename(columns=rename_map)
+        factor_df = factor_df.rename(columns=factor_name_map)
+        
+        # 与缓存数据合并
+        merged_df = pd.merge(
+            factor_df, self.base_df,
+            left_index=True, right_index=True, how="inner"
+        )
+        merged_df = pd.merge(
+            merged_df, self.target_df,
+            left_index=True, right_index=True, how="inner"
+        )
+        merged_df.dropna(inplace=True)
+        
+        if merged_df.empty:
+            return None, {}
+        
+        # 中性化处理
+        neu_cols = []
+        for expr, col in factor_name_map.items():
+            raw_col = f"{col}_raw"
+            size_col = f"{col}_size_neu"
+            neu_col = f"{col}_neu"
+            
+            merged_df[raw_col] = merged_df.groupby(level="datetime")[col].transform(_clip_outliers)
+            merged_df[raw_col] = merged_df[raw_col].fillna(0)
+            
+            merged_df[size_col] = merged_df.groupby(level="datetime", group_keys=False).apply(
+                lambda df_day, rc=raw_col: _regress_out_size(df_day, rc)
+            )
+            
+            merged_df[neu_col] = merged_df.groupby(["datetime", "$industry"])[size_col].transform(
+                _industry_neutralize_and_standardize
+            )
+            merged_df[neu_col] = merged_df[neu_col].fillna(0)
+            neu_cols.append(neu_col)
+        
+        # CSI500 过滤
+        analysis_df = merged_df
+        if self.csi500_index is not None:
+            in_membership = _align_membership_index(analysis_df.index, self.csi500_index)
+            analysis_df = analysis_df.loc[in_membership.values]
+        
+        if analysis_df.empty:
+            return None, {}
+        
+        # 最小二乘拟合
+        x = analysis_df[neu_cols].values
+        y = analysis_df["target"].values
+        if x.size == 0 or y.size == 0:
+            return None, {}
+        
+        try:
+            weights, _, _, _ = np.linalg.lstsq(x, y, rcond=None)
+        except Exception:
+            return None, {}
+        
+        # 计算 IC
+        preds = x.dot(weights)
+        pred_series = pd.Series(preds, index=analysis_df.index, name="pred")
+        ic_series = analysis_df.assign(pred=pred_series).groupby(level="datetime").apply(
+            lambda df_day: df_day["pred"].corr(df_day["target"], method="spearman")
+        )
+        ic_mean = ic_series.mean()
+        if np.isnan(ic_mean):
+            ic_mean = -1.0
+        
+        weights_dict = {
+            expr: float(weights[i]) for i, expr in enumerate(factor_expressions)
+        }
+        return ic_mean, weights_dict
+
+
 def fit_linear_ic(
     factor_expressions,
     start_date: str,

@@ -13,7 +13,7 @@ from factor_env import init_worker
 from dqn_model import DQN, RNN_DQN, RNN_DQN_Combined
 from qcm_module import QCMModule
 from quantile_network import QuantileNetwork
-from linear_model import fit_linear_ic, evaluate_factor_quality
+from linear_model import fit_linear_ic, evaluate_factor_quality, LinearModelFitter
 
 import traceback
 
@@ -68,6 +68,14 @@ class DeepQLearningAgent:
         self.top_factors = []  # 存储 dict: expr, ir, ic, icir, mono, weight
 
         self.ic_scale = 1000    # IC放大倍数
+
+        # 初始化 LinearModelFitter（缓存数据以加速 fit_linear_ic）
+        self.linear_fitter = LinearModelFitter(
+            start_date=env.start_date,
+            end_date=env.end_date,
+            provider_uri=env.provider_uri,
+            csi500_membership_path=env.csi500_membership_path,
+        )
 
     def select_action(self, state, valid_actions):
         if random.random() < self.epsilon:
@@ -149,25 +157,13 @@ class DeepQLearningAgent:
         old_ic = 0.0
         old_weights = {}
         if old_exprs:
-            old_ic, old_weights = fit_linear_ic(
-                old_exprs,
-                self.env.start_date,
-                self.env.end_date,
-                provider_uri=self.env.provider_uri,
-                csi500_membership_path=self.env.csi500_membership_path,
-            )
+            old_ic, old_weights = self.linear_fitter.fit_linear_ic(old_exprs)
             if old_ic is None:
                 return -2.0, False, None, 0.0, 0.0
 
         if len(old_exprs) < self.top_k:
             new_exprs = old_exprs + [expr]
-            new_ic, new_weights = fit_linear_ic(
-                new_exprs,
-                self.env.start_date,
-                self.env.end_date,
-                provider_uri=self.env.provider_uri,
-                csi500_membership_path=self.env.csi500_membership_path,
-            )
+            new_ic, new_weights = self.linear_fitter.fit_linear_ic(new_exprs)
             if new_ic is None:
                 return -2.0, False, None, old_ic, old_ic
             self.top_factors.append(new_factor)
@@ -175,13 +171,7 @@ class DeepQLearningAgent:
             return new_ic - old_ic, True, None, old_ic, new_ic
 
         candidate_exprs = old_exprs + [expr]
-        candidate_ic, candidate_weights = fit_linear_ic(
-            candidate_exprs,
-            self.env.start_date,
-            self.env.end_date,
-            provider_uri=self.env.provider_uri,
-            csi500_membership_path=self.env.csi500_membership_path,
-        )
+        candidate_ic, candidate_weights = self.linear_fitter.fit_linear_ic(candidate_exprs)
         if candidate_ic is None:
             self._sync_weights(old_weights)
             return -2.0, False, None, old_ic, old_ic
@@ -195,13 +185,7 @@ class DeepQLearningAgent:
             return 0.0, False, None, old_ic, old_ic
 
         updated_exprs = [e for e in old_exprs if e != min_expr] + [expr]
-        new_ic, new_weights = fit_linear_ic(
-            updated_exprs,
-            self.env.start_date,
-            self.env.end_date,
-            provider_uri=self.env.provider_uri,
-            csi500_membership_path=self.env.csi500_membership_path,
-        )
+        new_ic, new_weights = self.linear_fitter.fit_linear_ic(updated_exprs)
         if new_ic is None:
             self._sync_weights(old_weights)
             return -2.0, False, None, old_ic, old_ic
