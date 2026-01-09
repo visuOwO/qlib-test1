@@ -112,11 +112,11 @@ class GPUFactorEvaluator:
         self.date_to_idx = {d: i for i, d in enumerate(self.dates)}
         self.inst_to_idx = {inst: i for i, inst in enumerate(self.instruments)}
         
-        # 转换为密集张量 [num_dates, num_stocks]
-        self.target_tensor = torch.full((self.num_dates, self.num_stocks), float('nan'), device=self.device)
-        self.log_mkt_cap_tensor = torch.full((self.num_dates, self.num_stocks), float('nan'), device=self.device)
-        self.industry_tensor = torch.full((self.num_dates, self.num_stocks), -1, dtype=torch.long, device=self.device)
-        self.close_tensor = torch.full((self.num_dates, self.num_stocks), float('nan'), device=self.device)
+        # 先用 numpy 创建数据数组，然后一次性转换为 GPU 张量
+        target_np = np.full((self.num_dates, self.num_stocks), np.nan, dtype=np.float32)
+        log_mkt_cap_np = np.full((self.num_dates, self.num_stocks), np.nan, dtype=np.float32)
+        industry_np = np.full((self.num_dates, self.num_stocks), -1, dtype=np.int64)
+        close_np = np.full((self.num_dates, self.num_stocks), np.nan, dtype=np.float32)
         
         # 填充数据
         for (inst, dt), row in merged_df.iterrows():
@@ -125,16 +125,27 @@ class GPUFactorEvaluator:
             d_idx = self.date_to_idx[dt]
             s_idx = self.inst_to_idx[inst]
             
-            self.target_tensor[d_idx, s_idx] = row["target"] if not pd.isna(row["target"]) else float('nan')
-            self.close_tensor[d_idx, s_idx] = row["$close"] if not pd.isna(row["$close"]) else float('nan')
+            target_val = row["target"]
+            if not pd.isna(target_val):
+                target_np[d_idx, s_idx] = float(target_val)
+            
+            close_val = row["$close"]
+            if not pd.isna(close_val):
+                close_np[d_idx, s_idx] = float(close_val)
             
             circ_mv = row["$circ_mv"]
             if not pd.isna(circ_mv) and circ_mv > 0:
-                self.log_mkt_cap_tensor[d_idx, s_idx] = np.log(circ_mv + 1)
+                log_mkt_cap_np[d_idx, s_idx] = float(np.log(circ_mv + 1))
             
             industry = row["$industry"]
             if not pd.isna(industry):
-                self.industry_tensor[d_idx, s_idx] = int(industry)
+                industry_np[d_idx, s_idx] = int(industry)
+        
+        # 转换为 PyTorch 张量并移动到 GPU
+        self.target_tensor = torch.from_numpy(target_np).to(self.device)
+        self.log_mkt_cap_tensor = torch.from_numpy(log_mkt_cap_np).to(self.device)
+        self.industry_tensor = torch.from_numpy(industry_np).to(self.device)
+        self.close_tensor = torch.from_numpy(close_np).to(self.device)
         
         # 创建有效数据 mask
         self.valid_mask = ~torch.isnan(self.target_tensor) & ~torch.isnan(self.log_mkt_cap_tensor)
@@ -176,10 +187,12 @@ class GPUFactorEvaluator:
             factors: [batch_size, num_dates, num_stocks]
         """
         batch_size = len(factor_expressions)
-        factors = torch.full(
+        
+        # 先用 numpy 创建，避免 CUDA 张量赋值问题
+        factors_np = np.full(
             (batch_size, self.num_dates, self.num_stocks), 
-            float('nan'), 
-            device=self.device
+            np.nan, 
+            dtype=np.float32
         )
         
         # 展开 VWAP 表达式
@@ -195,10 +208,10 @@ class GPUFactorEvaluator:
             )
         except Exception as e:
             print(f"[GPUFactorEvaluator] Error loading factors: {e}")
-            return factors
+            return torch.from_numpy(factors_np).to(self.device)
         
         if factor_df.empty:
-            return factors
+            return torch.from_numpy(factors_np).to(self.device)
         
         # 重命名列
         if rename_map:
@@ -208,7 +221,7 @@ class GPUFactorEvaluator:
         if "SH000300" in factor_df.index.get_level_values("instrument"):
             factor_df = factor_df.drop("SH000300", level="instrument")
         
-        # 填充张量
+        # 填充 numpy 数组
         for (inst, dt), row in factor_df.iterrows():
             if inst not in self.inst_to_idx or dt not in self.date_to_idx:
                 continue
@@ -216,11 +229,12 @@ class GPUFactorEvaluator:
             s_idx = self.inst_to_idx[inst]
             
             for i, expr in enumerate(factor_expressions):
-                val = row[expr] if expr in row.index else float('nan')
+                val = row[expr] if expr in row.index else np.nan
                 if not pd.isna(val):
-                    factors[i, d_idx, s_idx] = val
+                    factors_np[i, d_idx, s_idx] = float(val)
         
-        return factors
+        # 转换为 GPU 张量
+        return torch.from_numpy(factors_np).to(self.device)
     
     def _clip_outliers_gpu(self, factors: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         """
