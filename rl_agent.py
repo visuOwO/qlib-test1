@@ -339,9 +339,6 @@ class DeepQLearningAgent:
                     state = self.builder.reset()
                     total_attempts += 1
                     
-                    # Epsilon Decay (Decay per episode/attempt)
-                    self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-                    
                     # Generate one full expression
                     done = False
                     temp_state = state
@@ -366,6 +363,10 @@ class DeepQLearningAgent:
                             else:
                                 # This is a new, valid factor to be evaluated
                                 seen_factors.add(expr)
+                                
+                                # Epsilon Decay: 仅在生成有效因子时衰减
+                                self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+                                
                                 print(f"Attempt {total_attempts} (Submitting for Eval): {expr}")
                                 future = executor.submit(
                                     evaluate_factor_quality,
