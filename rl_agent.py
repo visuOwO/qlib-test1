@@ -11,6 +11,8 @@ from factor_builder import FactorBuilder
 from factor_validator import FactorValidator
 from factor_env import init_worker
 from dqn_model import DQN, RNN_DQN, RNN_DQN_Combined
+from qcm_module import QCMModule
+from quantile_network import QuantileNetwork
 from linear_model import fit_linear_ic, evaluate_factor_quality
 
 import traceback
@@ -31,6 +33,25 @@ class DeepQLearningAgent:
             rnn_hidden_dim=hidden_dim, 
             dqn_hidden_dim=hidden_dim
         ).to(self.device)
+
+        # ========== QCM 模块：用于估计奖励分布的方差 ==========
+        # 分位数网络
+        self.quantile_net = QuantileNetwork(
+            action_dim=self.action_dim,
+            embedding_dim=64,
+            hidden_dim=hidden_dim
+        ).to(self.device)
+        
+        # QCM 模块
+        self.qcm = QCMModule(
+            quantile_network=self.quantile_net,
+            num_quantiles=32,
+            tau_min=0.05,
+            tau_max=0.95
+        )
+        
+        # UCB 探索参数 λ
+        self.ucb_lambda = 1.0
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
         self.memory = collections.deque(maxlen=2000)
@@ -54,14 +75,29 @@ class DeepQLearningAgent:
         
         with torch.no_grad():
             state_t = torch.LongTensor(state).unsqueeze(0).to(self.device)
-            q_values = self.policy_net(state_t)
             
-            # Mask invalid actions with -inf
-            full_mask = torch.full(q_values.shape, -float('inf')).to(self.device)
-            full_mask[0, valid_actions] = 0 # Unmask valid
+            # 1. 获取 Q 值（来自 DQN 网络）
+            q_values = self.policy_net(state_t)  # [1, action_dim]
             
-            masked_q = q_values + full_mask
-            return masked_q.argmax().item()
+            # 2. 获取方差估计（来自 QCM 模块）
+            variance = self.qcm(state_t)  # [1, action_dim]
+            
+            # 3. 计算 UCB 风格的分数：Score = Q + λ * sqrt(Variance)
+            # 使用 clamp 避免负方差导致的 NaN
+            std = torch.sqrt(torch.clamp(variance, min=1e-8))
+            scores = q_values + self.ucb_lambda * std
+            
+            # 4. 屏蔽无效动作
+            full_mask = torch.full(scores.shape, -float('inf')).to(self.device)
+            full_mask[0, valid_actions] = 0  # Unmask valid
+            
+            masked_scores = scores + full_mask
+            return masked_scores.argmax().item()
+    
+    def set_ucb_lambda(self, value):
+        """设置 UCB 探索参数 λ"""
+        self.ucb_lambda = value
+        print(f"UCB lambda updated to: {value}")
 
     def optimize_model(self):
         if len(self.memory) < self.batch_size:

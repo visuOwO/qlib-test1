@@ -72,9 +72,9 @@ class QCMModule(nn.Module):
         device = x.device
         
         # ========== 1. 获取分位数预测 ==========
-        # 扩展 τ 到 batch 维度
+        # 扩展 τ 到 batch 维度，并确保在正确的 device 上
         # fixed_taus: [K] -> [batch, K]
-        taus = self.fixed_taus.unsqueeze(0).expand(batch_size, -1)
+        taus = self.fixed_taus.unsqueeze(0).expand(batch_size, -1).to(device)
         
         # 通过分位数网络获取预测值
         # quantile_values: [batch, K, action_dim]
@@ -168,7 +168,7 @@ class QCMModule(nn.Module):
         device = x.device
         
         # 获取分位数预测
-        taus = self.fixed_taus.unsqueeze(0).expand(batch_size, -1)
+        taus = self.fixed_taus.unsqueeze(0).expand(batch_size, -1).to(device)
         quantile_values = self.quantile_network(x, taus)
         
         if action_idx is not None:
@@ -305,7 +305,7 @@ class QCMWithCornishFisherExpansion(QCMModule):
         batch_size = x.size(0)
         device = x.device
         
-        taus = self.fixed_taus.unsqueeze(0).expand(batch_size, -1)
+        taus = self.fixed_taus.unsqueeze(0).expand(batch_size, -1).to(device)
         quantile_values = self.quantile_network(x, taus)
         
         if action_idx is not None:
